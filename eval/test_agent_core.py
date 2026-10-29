@@ -3,8 +3,9 @@ import json
 import unittest
 
 from agent.core import (
-    CHECK_ORDER, CheckResult, CheckVerdict, CallFlow, Flag, Judge, Stage,
-    VerdictInput, compute_verdict, detect_flags, parse_judge_response,
+    CHECK_ORDER, CheckResult, CheckVerdict, CallFlow, Flag, Judge, JudgeResult, Stage,
+    VerdictInput, compute_verdict, detect_flags, evaluate_check,
+    evaluate_with_retry, parse_judge_response,
     parse_number,
 )
 
@@ -105,6 +106,43 @@ class JudgeAndVerdictTests(unittest.TestCase):
             await asyncio.sleep(0.02)
             return '{}'
         self.assertEqual(asyncio.run(Judge(slow, timeout=0.001).judge("stop_paying", "", "idk")).verdict, "unclear")
+
+    def test_async_judge_result_is_awaited_and_evaluated(self):
+        async def request(key, expected, answer):
+            self.assertEqual((key, expected, answer), ("product_type", "deferred annuity", "pension plan"))
+            return json.dumps({"verdict": "correct", "quote": "pension plan", "reason": "matches"})
+        policy = {"product_type": "deferred annuity"}
+        async def run():
+            result, prompt = await evaluate_with_retry(
+                "product_type", "pension plan", policy,
+                re_explanation="Please explain the plan type.",
+                get_retry=lambda: self.fail("passing first answer must not retry"),
+                judge=Judge(request),
+            )
+            return result, prompt
+        result, prompt = asyncio.run(run())
+        self.assertEqual(result.verdict, CheckVerdict.PASS)
+        self.assertIsNone(prompt)
+
+    def test_invalid_judge_results_never_pass(self):
+        policy = {"product_type": "annuity"}
+        for jr in (JudgeResult("unclear", "", "timeout"), JudgeResult("maybe", "x", "invalid verdict"), JudgeResult("correct", "fabricated", "bad quote"), JudgeResult("correct", "", "missing quote")):
+            self.assertNotEqual(evaluate_check("product_type", "FD", policy, judge_result=jr).verdict, CheckVerdict.PASS)
+
+    def test_retry_occurs_once_and_returns_prompt_not_playback_claim(self):
+        calls = []
+        async def request_retry():
+            calls.append("retry")
+            return "unknown"
+        policy = {"premium_term_years": 5}
+        result, prompt = asyncio.run(evaluate_with_retry(
+            "premium_term", "one year", policy,
+            re_explanation="The record says five years.", get_retry=request_retry,
+        ))
+        self.assertEqual(calls, ["retry"])
+        self.assertEqual(result.retries, 1)
+        self.assertEqual(result.verdict, CheckVerdict.UNCLEAR)
+        self.assertEqual(prompt, "The record says five years.")
 
     def test_non_green_safety(self):
         for checks, flags, unresolved, consent, low, failure, expected in [

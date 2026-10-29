@@ -163,7 +163,7 @@ class CheckResult:
     reason: str = ""
 
 
-def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge: "Judge | None" = None) -> CheckResult:
+def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge_result: "JudgeResult | None" = None) -> CheckResult:
     mandatory = key in MANDATORY_CHECKS
     if not answer.strip():
         return CheckResult(key, CheckVerdict.UNCLEAR, answer, mandatory, reason="empty answer")
@@ -184,22 +184,33 @@ def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge: "
             return CheckResult(key, CheckVerdict.PASS if premium <= income else CheckVerdict.FAIL, answer, False, reason="affordability warning" if premium > income else "")
         except (KeyError, TypeError, ValueError):
             return CheckResult(key, CheckVerdict.UNCLEAR, answer, False, reason="required policy data unavailable")
-    if key not in JUDGE_CHECKS or judge is None:
-        return CheckResult(key, CheckVerdict.UNCLEAR, answer, mandatory, reason="judge required or unsupported check")
-    expected_key = {"product_type": "product_type", "payout_recipient": "payout_recipient", "stop_paying": "stop_paying_explanation"}[key]
-    try:
-        verdict = judge.decide(key, str(policy[expected_key]), answer)
-        return CheckResult(key, CheckVerdict.PASS if verdict.verdict == "correct" else CheckVerdict.FAIL if verdict.verdict == "incorrect" else CheckVerdict.UNCLEAR, answer, mandatory, reason=verdict.reason)
-    except (KeyError, ValueError, TimeoutError):
-        return CheckResult(key, CheckVerdict.UNCLEAR, answer, mandatory, reason="judge unavailable or invalid")
+    if key not in JUDGE_CHECKS or judge_result is None:
+        return CheckResult(key, CheckVerdict.UNCLEAR, answer, mandatory, reason="validated judge result required")
+    verdicts = {"correct": CheckVerdict.PASS, "incorrect": CheckVerdict.FAIL, "unclear": CheckVerdict.UNCLEAR}
+    verdict = verdicts.get(judge_result.verdict, CheckVerdict.UNCLEAR)
+    if verdict == CheckVerdict.PASS and (not judge_result.quote or judge_result.quote not in answer):
+        verdict = CheckVerdict.UNCLEAR
+    return CheckResult(key, verdict, answer, mandatory, reason=judge_result.reason)
 
 
-async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, Any], *, re_explanation: str, get_retry: Callable[[], Awaitable[str]], judge: "Judge | None" = None) -> tuple[CheckResult, str]:
-    result = evaluate_check(key, first_answer, policy, judge=judge)
+async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, Any], *, re_explanation: str, get_retry: Callable[[], Awaitable[str]], judge: "Judge | None" = None) -> tuple[CheckResult, str | None]:
+    async def evaluate(answer: str) -> CheckResult:
+        if key in JUDGE_CHECKS:
+            if judge is None:
+                return evaluate_check(key, answer, policy)
+            expected_key = {"product_type": "product_type", "payout_recipient": "payout_recipient", "stop_paying": "stop_paying_explanation"}[key]
+            try:
+                judge_result = await judge.judge(key, str(policy[expected_key]), answer)
+            except (KeyError, ValueError, TypeError):
+                judge_result = JudgeResult("unclear", "", "judge input unavailable")
+            return evaluate_check(key, answer, policy, judge_result=judge_result)
+        return evaluate_check(key, answer, policy)
+
+    result = await evaluate(first_answer)
     if result.verdict == CheckVerdict.PASS:
-        return result, ""
+        return result, None
     retry_answer = await get_retry()
-    retry = evaluate_check(key, retry_answer, policy, judge=judge)
+    retry = await evaluate(retry_answer)
     retry.retries = 1
     if retry.verdict == CheckVerdict.PASS:
         retry.verdict = CheckVerdict.PASS_AFTER_RETRY
@@ -240,10 +251,6 @@ class Judge:
             return parse_judge_response(raw, answer)
         except (asyncio.TimeoutError, ValueError, TypeError):
             return JudgeResult("unclear", "", "judge timeout or invalid response")
-
-    def decide(self, key: str, expected: str, answer: str) -> JudgeResult:
-        raise RuntimeError("async judge must be awaited by the orchestration layer")
-
 
 @dataclass
 class VerdictInput:
