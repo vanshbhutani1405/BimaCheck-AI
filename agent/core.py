@@ -78,45 +78,48 @@ def parse_number(text: str) -> int | float:
     raw = text.strip().lower().replace(",", "")
     if not raw:
         raise NumberParseError("empty number")
-    if re.fullmatch(r"\d+(?:\.\d+)?", raw):
-        value = float(raw) if "." in raw else int(raw)
-        return int(value) if isinstance(value, float) and value.is_integer() else value
     raw = re.sub(r"\s+", " ", raw)
-    if raw in _FRACTIONS:
-        return _FRACTIONS[raw]
     words = raw.split()
-    total = section = 0
-    fraction = None
-    index = 0
-    while index < len(words):
-        word = words[index]
-        if word in _FRACTIONS:
-            if fraction is not None or section or index + 1 >= len(words) or words[index + 1] not in _SCALE:
-                raise NumberParseError(f"ambiguous fraction near {word!r}")
-            fraction = _FRACTIONS[word]
-            index += 1
-            word = words[index]
-        if word in _ONES:
-            section += _ONES[word]
-        elif word in _TENS:
-            section += _TENS[word]
-        elif word in _SCALE:
+    if words[-1] in {"saal", "साल", "varsh", "वर्ष", "rupees", "रुपये", "रुपया"}:
+        words.pop()
+    if not words:
+        raise NumberParseError("number is missing")
+    if len(words) == 1 and re.fullmatch(r"\d+(?:\.\d+)?", words[0]):
+        value = float(words[0]) if "." in words[0] else int(words[0])
+        return int(value) if isinstance(value, float) and value.is_integer() else value
+
+    total = 0.0
+    quantity = 0.0
+    has_quantity = False
+    saw_magnitude = False
+    previous_scale = float("inf")
+    for word in words:
+        if word in _SCALE:
             scale = _SCALE[word]
-            if scale == 1_000 and section == 0:
-                raise NumberParseError("scale has no quantity")
-            total += (section or 1) * scale
-            section = 0
-            if fraction is not None:
-                total += fraction * scale
-                fraction = None
-        elif word.isdigit():
-            section += int(word)
+            if not has_quantity or scale >= previous_scale:
+                raise NumberParseError("incomplete or repeated magnitude")
+            total += quantity * scale
+            quantity = 0.0
+            has_quantity = False
+            saw_magnitude = True
+            previous_scale = scale
+            continue
+        if has_quantity:
+            raise NumberParseError("ambiguous adjacent numeric quantities")
+        if word in _FRACTIONS:
+            quantity = _FRACTIONS[word]
+        elif re.fullmatch(r"\d+(?:\.\d+)?", word):
+            quantity = float(word)
+        elif word in _ONES:
+            quantity = _ONES[word]
+        elif word in _TENS:
+            quantity = _TENS[word]
         else:
             raise NumberParseError(f"unsupported or ambiguous token: {word!r}")
-        index += 1
-    if fraction is not None:
-        raise NumberParseError("fraction requires a scale")
-    result = total + section
+        has_quantity = True
+    if not has_quantity and not saw_magnitude:
+        raise NumberParseError("incomplete magnitude")
+    result = total + (quantity if has_quantity else 0)
     return int(result) if float(result).is_integer() else result
 
 

@@ -28,7 +28,9 @@ class NumberParserTests(unittest.TestCase):
             ("ek crore", 10000000), ("dedh lakh", 150000), ("dhai lakh", 250000),
             ("sawa lakh", 125000), ("1 lakh", 100000), ("1.5 lakh", 150000),
             ("1 lakh 50 hazaar", 150000), ("do lakh teen hazaar", 203000),
-            ("bees saal", 20), ("paintalis", 45), ("पैंतालीस", 45),
+            ("bees saal", 20), ("bees वर्ष", 20), ("dedh लाख", 150000),
+            ("dhai lakh", 250000), ("sawa lakh", 125000),
+            ("1.5 lakh rupees", 150000), ("paintalis", 45), ("पैंतालीस", 45),
         ]
         self.assertGreaterEqual(len(cases), 60)
         for utterance, expected in cases:
@@ -40,7 +42,7 @@ class NumberParserTests(unittest.TestCase):
                     self.assertEqual(parse_number(utterance), expected)
 
     def test_ambiguous_or_invalid(self):
-        for utterance in ("", "kal", "dedh bees", "lakh", "1 twenty", "bees bees"):
+        for utterance in ("", "kal", "dedh bees", "lakh", "1 twenty", "bees bees", "1.5.2 lakh", "bees lakh lakh", "saal"):
             with self.subTest(utterance=utterance), self.assertRaises(ValueError):
                 parse_number(utterance)
 
@@ -87,7 +89,7 @@ class FlowTests(unittest.TestCase):
 class JudgeAndVerdictTests(unittest.TestCase):
     def test_labelled_judge_fixtures(self):
         fixtures = [
-            ('{"verdict":"correct","quote":"pension","reason":"matches"}', "Pension milegi", "correct"),
+            ('{"verdict":"correct","quote":"Pension","reason":"matches"}', "Pension milegi", "correct"),
             ('{"verdict":"incorrect","quote":"FD","reason":"wrong product"}', "FD hai", "incorrect"),
             ('{"verdict":"unclear","quote":"shayad","reason":"uncertain"}', "shayad", "unclear"),
         ]
