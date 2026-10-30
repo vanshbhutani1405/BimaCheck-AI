@@ -1,0 +1,4 @@
+# Python 3.11.9 is selected by .python-version.
+# Required by agent.workflow.LiveKitGnaniConfig when the provider adapter is enabled.
+livekit-agents==1.8.10
+livekit-plugins-gnani==1.8.10
