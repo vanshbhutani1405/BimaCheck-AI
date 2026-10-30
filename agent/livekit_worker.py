@@ -79,7 +79,7 @@ class LiveKitAgentSessionPort:
     async def speak(self, text: str) -> None:
         if self._session is None:
             raise RuntimeError("LiveKit AgentSession has not started")
-        await self._session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
+        await self._session.say(normalize_tts_text(text), allow_interruptions=True, add_to_chat_ctx=False)
 
     async def stop_playback(self) -> None:
         if self._session is not None:
