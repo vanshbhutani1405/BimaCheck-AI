@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from agent.livekit_worker import LiveKitSessionIO, run_workflow_session
+from agent.livekit_worker import LiveKitAgentSessionPort, LiveKitSessionIO, run_workflow_session
 
 
 class FakeSession:
@@ -31,6 +31,31 @@ class FakeSession:
 
     async def close(self):
         self.closed += 1
+
+
+class FakeRoom:
+    class Participant:
+        def __init__(self): self.messages = []
+        async def publish_data(self, payload, *, reliable, topic):
+            self.messages.append((payload, reliable, topic))
+    def __init__(self): self.local_participant = self.Participant()
+
+
+class FakeAgentSession:
+    def __init__(self, **kwargs):
+        self.kwargs, self.handlers, self.started = kwargs, {}, None
+        self.said, self.interrupted, self.shutdown_args = [], [], None
+    def on(self, event):
+        def register(handler): self.handlers[event] = handler; return handler
+        return register
+    async def start(self, **kwargs): self.started = kwargs
+    async def say(self, text, **kwargs): self.said.append((text, kwargs))
+    async def interrupt(self, **kwargs): self.interrupted.append(kwargs)
+    def shutdown(self, **kwargs): self.shutdown_args = kwargs
+
+
+class FakeAgent:
+    def __init__(self, **kwargs): self.kwargs = kwargs
 
 
 class WorkerTests(unittest.TestCase):
@@ -76,6 +101,28 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 asyncio.run(run_workflow_session(session, {"name": "Asha"}, {}))
         self.assertEqual(session.closed, 1)
+
+    def test_room_bound_port_uses_agent_session_and_data_channel(self):
+        room = FakeRoom()
+        port = LiveKitAgentSessionPort(room, session_factory=FakeAgentSession, agent_factory=FakeAgent)
+
+        async def exercise():
+            await port.start(stt="prisma", tts="timbre")
+            session = port._session
+            session.handlers["user_input_transcribed"](type("Event", (), {"is_final": True, "transcript": "bees saal"})())
+            self.assertEqual(await port.listen(), "bees saal")
+            await port.speak("  Namaste   ji ")
+            await port.stop_playback()
+            await port.publish({"type": "transcript", "text": "bees saal"})
+            await port.close()
+            return session
+
+        session = asyncio.run(exercise())
+        self.assertEqual(session.started["room"], room)
+        self.assertEqual(session.said[0][0], "Namaste ji")
+        self.assertEqual(session.interrupted, [{"force": True}])
+        self.assertEqual(session.shutdown_args, {"drain": False})
+        self.assertIn('"type":"transcript"', room.local_participant.messages[0][0])
 
 
 if __name__ == "__main__":
