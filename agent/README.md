@@ -8,4 +8,6 @@ The workflow's `listen()` contract returns one string. It does not expose partia
 
 `runtime_support.py` provides provider-independent helpers for stable synthesis cache keys, listener-approved in-memory audio entries, and monotonic turn timing. The timer returns missing STT timing as `None` when no final transcript mark was supplied; these helpers are not connected to a provider session or persistent metrics store.
 
+`livekit_worker.py` now provides the concrete lifecycle around a small `SessionPort`: it builds the configured Gnani providers, starts the session, runs `CallWorkflow`, cancels active playback before replacement, publishes workflow events through the port, and closes the session in a `finally` block. It does not claim to bind LiveKit room tracks or SDK callbacks; that binding remains the deployment-specific implementation of `SessionPort`.
+
 Next integration work should inspect the installed LiveKit 1.8.10 and Gnani 1.8.10 APIs from the project's working Python 3.11.9 installation, then bind a session adapter and test with mocks before any synthetic live call. Keep `core.py` authoritative for all call decisions and follow the plan for event contracts and late transcripts.

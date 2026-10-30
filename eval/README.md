@@ -6,6 +6,7 @@ This directory contains reproducible local tests and will hold measured evidence
 
 - No audio fixtures, call logs, transcripts, credit reports, latency records, pronunciation results, or endpointing experiments were present in the repository.
 - `test_runtime_support.py` tests deterministic synthesis-cache keying, the listener-approval guard for cached bytes, and timer arithmetic with a fake monotonic clock. It does not call or validate LiveKit/Gnani.
+- `test_livekit_worker.py` tests provider startup/cleanup, consent refusal through the workflow, normalized playback, interruption, and cleanup on a transport error using a fake `SessionPort`.
 - The project `.venv` cannot currently start: its `pyvenv.cfg` points to `C:\Users\pc\AppData\Local\Programs\Python\Python311`, where the base interpreter is missing. The package source files are present but Windows denied reads. Do not replace this evidence with a test run from another Python environment.
 - The installed `livekit-plugins-gnani==1.8.10` package is evidence of a prepared adapter, not evidence that a live request succeeded. Its documented interfaces are Prisma STT streaming (`wss://api.vachana.ai/stt/v3/stream`), Prisma STT REST (`/stt/v3`), and Timbre TTS REST/SSE/WebSocket (`/api/v1/tts`).
 - The adapter supports `timbre-v2.5`, while its default is `timbre-v2.0`. The plan's required Timbre `v2.5` choice has not been exercised or pronunciation-checked in this repository.
