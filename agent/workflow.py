@@ -18,6 +18,7 @@ from agent.core import (
     evaluate_with_retry,
 )
 from agent.session import ConsentStatus, SessionContext, SessionStatus
+from agent.policy import Policy
 
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,10 @@ def format_policy_value(value: Any, *, kind: str) -> str:
 
 def re_explanation_for(key: str, policy: Mapping[str, Any]) -> str:
     """Build a spoken retry explanation from the supplied policy facts."""
+    if isinstance(policy, Policy):
+        explanation = policy.approved_explanation(key)
+        if explanation is not None:
+            return explanation
     if key == "premium_amount":
         return f"record ke mutabik har saal ka premium {format_policy_value(policy['premium_amount'], kind='amount')} rupaye hai"
     if key == "premium_term":
@@ -123,33 +128,60 @@ def policy_question_response(text: str, policy: Mapping[str, Any]) -> str | None
     def unavailable() -> str:
         return "Is baat ki jaankari policy record mein uplabdh nahi hai."
 
+    def approved(fact_id: str, explanation_id: str, fallback: str) -> str:
+        if isinstance(policy, Policy):
+            fact = policy.get_fact(fact_id=fact_id)
+            if not fact.exists or not fact.available:
+                return unavailable()
+            return policy.approved_explanation(explanation_id) or fallback
+        return fallback
+
     if re.search(r"(?:\bfd\b|fixed deposit|फिक्स्ड डिपॉजिट|एफडी)", normalized) and (
         "kya" in normalized or "hai na" in normalized or "?" in normalized or "क्या" in normalized
     ):
         product_type = policy.get("product_type")
         if product_type is None:
             return unavailable()
-        return f"Nahi, yeh fixed deposit nahi hai. Yeh {product_type} hai."
+        return approved(
+            "product_identity.product_type",
+            "fixed_deposit_confusion",
+            f"Nahi, yeh fixed deposit nahi hai. Yeh {product_type} hai.",
+        )
 
     if re.search(r"premium.*(?:kitna|कितना)|(?:kitna|कितना).*premium|कितना प्रीमियम", normalized):
         amount = policy.get("premium_amount")
-        return unavailable() if amount is None else f"Record ke mutabik har saal ka premium {format_policy_value(amount, kind='amount')} rupaye hai."
+        return unavailable() if amount is None else approved(
+            "premium.amount", "premium_amount",
+            f"Record ke mutabik har saal ka premium {format_policy_value(amount, kind='amount')} rupaye hai.",
+        )
 
     if re.search(r"premium.*(?:kitne saal|कितने साल)|(?:kitne saal|कितने साल).*premium|कितने साल.*भर", normalized):
         years = policy.get("premium_term_years")
-        return unavailable() if years is None else f"Premium har saal {format_policy_value(years, kind='duration')} tak bharna hai."
+        return unavailable() if years is None else approved(
+            "premium.payment_term_years", "premium_term",
+            f"Premium har saal {format_policy_value(years, kind='duration')} tak bharna hai.",
+        )
 
     if re.search(r"policy.*(?:kitne saal|कितने साल)|(?:kitne saal|कितने साल).*policy", normalized):
         years = policy.get("policy_term_years")
-        return unavailable() if years is None else f"Policy {format_policy_value(years, kind='duration')} tak chalegi."
+        return unavailable() if years is None else approved(
+            "policy_duration.total_term_years", "policy_term",
+            f"Policy {format_policy_value(years, kind='duration')} tak chalegi.",
+        )
 
     if re.search(r"(?:pension|payout|पेंशन|पेंशन|payout).*(?:kab|कब)|(?:kab|कब).*(?:shuru|शुरू|pension|पेंशन)", normalized):
         years = policy.get("payout_start_after_years")
-        return unavailable() if years is None else f"Pension {format_policy_value(years, kind='duration')} baad shuru hogi."
+        return unavailable() if years is None else approved(
+            "benefits_and_payouts.payout_timing", "payout_timing",
+            f"Pension {format_policy_value(years, kind='duration')} baad shuru hogi.",
+        )
 
     if re.search(r"(?:payout|paisa|पैसा|पेंशन).*(?:kisko|किसको|kise|किसे|kaun|कौन)|(?:kisko|किसको|kise|किसे).*(?:milega|मिलेगा)", normalized):
         recipient = policy.get("payout_recipient")
-        return unavailable() if recipient is None else f"Policy record ke mutabik payout {recipient} ko milega."
+        return unavailable() if recipient is None else approved(
+            "benefits_and_payouts.payout_recipient", "payout_recipient",
+            f"Policy record ke mutabik payout {recipient} ko milega.",
+        )
 
     return None
 
@@ -263,6 +295,13 @@ class CallWorkflow:
             premium_term_years=format_policy_value(self.policy["premium_term_years"], kind="duration"),
             policy_term_years=format_policy_value(self.policy["policy_term_years"], kind="duration"),
         )
+        for fact_id in (
+            "product_identity.product_name",
+            "premium.amount",
+            "premium.payment_term_years",
+            "policy_duration.total_term_years",
+        ):
+            self.session.disclose_policy_fact(fact_id)
         await self._say(facts)
         facts_ack = (await self._answer_for_prompt(facts, verification_check_id="facts_confirmation")).casefold()
         if self.session.pending_question:

@@ -1,0 +1,143 @@
+{
+  "policy_id": "suraksha_pension_plus_demo",
+  "policy_version": "1.0",
+  "product_identity": {
+    "product_name": {
+      "available": true,
+      "value": "Suraksha Pension Plus",
+      "explanation": "यह product Suraksha Pension Plus है।"
+    },
+    "product_category": {
+      "available": true,
+      "value": "pension",
+      "explanation": "यह एक pension product है।"
+    },
+    "product_type": {
+      "available": true,
+      "value": "deferred annuity",
+      "explanation": "यह fixed deposit नहीं है; यह deferred annuity है।"
+    },
+    "currency": {
+      "available": true,
+      "value": "INR",
+      "explanation": "रकम Indian Rupees में दी गई है।"
+    }
+  },
+  "premium": {
+    "amount": {
+      "available": true,
+      "value": 150000,
+      "explanation": "हर साल का premium एक लाख पचास हज़ार रुपये है।"
+    },
+    "frequency": {
+      "available": true,
+      "value": "annual",
+      "explanation": "Premium हर साल भरना है।"
+    },
+    "payment_term_years": {
+      "available": true,
+      "value": 5,
+      "explanation": "Premium पाँच साल तक हर साल भरना है।"
+    },
+    "payment_details": {
+      "available": true,
+      "value": "annual premium payments for the stated payment term",
+      "explanation": "Premium एक बार नहीं, बताए गए payment term के दौरान हर साल भरना है।"
+    }
+  },
+  "policy_duration": {
+    "total_term_years": {
+      "available": true,
+      "value": 20,
+      "explanation": "Policy बीस साल तक चलेगी।"
+    },
+    "relevant_dates": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "Specific calendar dates are not part of this synthetic policy."
+    }
+  },
+  "benefits_and_payouts": {
+    "benefit_description": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "A detailed benefit schedule is not established for this demo policy."
+    },
+    "payout_amount_or_rule": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "No payout amount or calculation rule is established for this demo policy."
+    },
+    "payout_recipient": {
+      "available": true,
+      "value": "Sunita",
+      "explanation": "Policy record के मुताबिक payout Sunita को मिलेगा।"
+    },
+    "payout_timing": {
+      "available": true,
+      "value": "after 5 years",
+      "years_after_start": 5,
+      "explanation": "Pension पाँच साल बाद शुरू होगी।"
+    },
+    "benefit_conditions": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "Additional benefit conditions are not established for this demo policy."
+    }
+  },
+  "discontinuance": {
+    "consequences": {
+      "available": true,
+      "value": "policy may lapse or benefits may reduce",
+      "explanation": "Premium देना रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
+    },
+    "grace_period": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "No grace-period value is established for this demo policy."
+    },
+    "revival": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "No revival terms are established for this demo policy."
+    },
+    "approved_customer_explanation": {
+      "available": true,
+      "value": "stopping premium payments may cause the policy to lapse or benefits to reduce",
+      "explanation": "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
+    }
+  },
+  "exclusions_and_limitations": {
+    "known_limitations": {
+      "available": false,
+      "value": null,
+      "explanation": null,
+      "limitation": "No additional exclusions or limitations are established for this demo policy."
+    }
+  },
+  "approved_explanations": {
+    "unsupported_fact": "इस policy record में इस बात की जानकारी उपलब्ध नहीं है। मैं इसकी पुष्टि नहीं कर सकता।",
+    "fixed_deposit_confusion": "यह fixed deposit नहीं है; यह deferred annuity pension product है।",
+    "premium_amount": "Record के मुताबिक हर साल का premium एक लाख पचास हज़ार रुपये है।",
+    "premium_term": "Premium हर साल पाँच साल तक भरना है।",
+    "policy_term": "Policy बीस साल तक चलेगी।",
+    "payout_recipient": "Policy record के मुताबिक payout Sunita को मिलेगा।",
+    "payout_timing": "Pension पाँच साल बाद शुरू होगी।",
+    "stop_paying": "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
+  },
+  "verification_mapping": {
+    "premium_amount": "premium.amount",
+    "premium_term": "premium.payment_term_years",
+    "policy_term": "policy_duration.total_term_years",
+    "product_type": "product_identity.product_type",
+    "payout_recipient": "benefits_and_payouts.payout_recipient",
+    "payout_timing": "benefits_and_payouts.payout_timing",
+    "stop_paying": "discontinuance.consequences"
+  }
+}

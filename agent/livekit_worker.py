@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Protocol
 from agent.core import Judge, VerdictInput, compute_verdict
 from agent.workflow import CallWorkflow, LiveKitGnaniConfig, WorkflowResult, normalize_tts_text
 from agent.session import SessionContext, SessionStatus
+from agent.policy import load_policy
 
 
 logger = logging.getLogger(__name__)
@@ -195,16 +196,10 @@ class LiveKitAgentSessionPort:
             self._session = None
 
 
-def synthetic_call_data() -> tuple[dict[str, Any], dict[str, Any]]:
+def synthetic_call_data() -> tuple[dict[str, Any], Mapping[str, Any]]:
     """Return the plan's fictional primary scenario for local development."""
-    return ({"name": "Vansh", "name_variants": ("वंश",)}, {
-        "product_name": "Suraksha Pension Plus", "premium_amount": 150000,
-        "premium_term_years": 5, "policy_term_years": 20,
-        "payout_start_after_years": 5, "product_type": "deferred annuity",
-        "payout_recipient": "Sunita",
-        "stop_paying_explanation": "policy may lapse or benefits may reduce",
-        "declared_income": 600000,
-    })
+    customer = {"name": "Vansh", "name_variants": ("वंश",), "declared_income": 600000}
+    return customer, load_policy().with_customer_context(customer)
 
 
 def create_livekit_server(call_data_loader: Callable[[Any], tuple[Mapping[str, Any], Mapping[str, Any]]] = lambda _ctx: synthetic_call_data()) -> Any:
