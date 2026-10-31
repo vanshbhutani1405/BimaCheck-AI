@@ -1,4 +1,15 @@
-# Python 3.11.9 is selected by .python-version.
-# Required by agent.workflow.LiveKitGnaniConfig when the provider adapter is enabled.
+# BimaCheck AI — Python 3.11.9
+
+# LiveKit voice agent
 livekit-agents==1.8.10
 livekit-plugins-gnani==1.8.10
+
+# Environment configuration
+python-dotenv>=1.0,<2.0
+
+# Testing
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<2.0
+
+# Google Gemini judge — add when implemented
+# google-genai>=1.0,<2.0

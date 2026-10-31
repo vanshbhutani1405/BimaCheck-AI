@@ -123,6 +123,97 @@ def parse_number(text: str) -> int | float:
     return int(result) if float(result).is_integer() else result
 
 
+_NUMBER_WORDS = frozenset((*_ONES, *_TENS, *_SCALE, *_FRACTIONS))
+_NUMBER_CONTEXT_UNITS = frozenset({
+    "saal", "साल", "varsh", "वर्ष", "year", "years",
+    "rupees", "रुपये", "रुपया", "rs",
+})
+_NUMBER_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[A-Za-z]+|[\u0900-\u097F]+", re.UNICODE)
+
+
+def _numeric_token(token: str) -> bool:
+    return token in _NUMBER_WORDS or bool(re.fullmatch(r"\d+(?:\.\d+)?", token))
+
+
+def _number_candidates(text: str) -> list[tuple[int | float, int, int, tuple[str, ...]]]:
+    """Return contiguous numeric spans with an optional unit such as ``saal``."""
+    tokens = [token.casefold() for token in _NUMBER_TOKEN_RE.findall(text)]
+    candidates: list[tuple[int | float, int, int, tuple[str, ...]]] = []
+    index = 0
+    while index < len(tokens):
+        if not _numeric_token(tokens[index]):
+            index += 1
+            continue
+        end = index
+        while end + 1 < len(tokens) and _numeric_token(tokens[end + 1]):
+            end += 1
+        if end + 1 < len(tokens) and tokens[end + 1] in _NUMBER_CONTEXT_UNITS:
+            end += 1
+        phrase = tuple(tokens[index:end + 1])
+        try:
+            value = parse_number(" ".join(phrase))
+        except NumberParseError:
+            index = end + 1
+            continue
+        candidates.append((value, index, end, phrase))
+        index = end + 1
+    return candidates
+
+
+def extract_number_for_check(key: str, text: str) -> int | float | None:
+    """Extract one unambiguous number relevant to a numeric verification check.
+
+    The strict ``parse_number`` grammar remains unchanged. This layer only
+    locates numeric spans in ordinary Hindi/Hinglish sentences and uses the
+    pending check's words and units to disambiguate them. A tie or multiple
+    equally plausible spans is deliberately returned as ``None``.
+    """
+    if key not in {"premium_amount", "premium_term", "policy_term", "payout_timing"}:
+        return None
+    try:
+        # Preserve the established strict-expression behavior for bare answers.
+        return parse_number(text)
+    except NumberParseError:
+        pass
+    tokens = [token.casefold() for token in _NUMBER_TOKEN_RE.findall(text)]
+    candidates = _number_candidates(text)
+    if not candidates:
+        return None
+
+    amount_keys = {"lakh", "लाख", "crore", "करोड़", "hazaar", "हजार", "हज़ार", "rupees", "रुपये", "रुपया", "rs"}
+    year_units = {"saal", "साल", "varsh", "वर्ष", "year", "years"}
+    key_words = {
+        "premium_amount": {"premium", "प्रीमियम", "rupaye", "रुपये", "रुपया", "rs"},
+        "premium_term": {"premium", "प्रीमियम", "bharna", "भरना", "dena", "देना", "tak", "तक"},
+        "policy_term": {"policy", "पॉलिसी", "chalegi", "चलेगी", "term"},
+        "payout_timing": {"pension", "पेंशन", "payout", "kab", "कब", "baad", "बाद", "shuru", "शुरू"},
+    }[key]
+
+    amount_candidates = [candidate for candidate in candidates if any(token in amount_keys for token in candidate[3])]
+    year_candidates = [candidate for candidate in candidates if any(token in year_units for token in candidate[3])]
+    relevant_candidates = amount_candidates if key == "premium_amount" else year_candidates
+    if len(relevant_candidates) > 1:
+        return None
+
+    scored: list[tuple[int, int | float]] = []
+    for value, start, end, phrase in candidates:
+        window = set(tokens[max(0, start - 3):min(len(tokens), end + 4)])
+        score = len(window & key_words)
+        if any(token in amount_keys for token in phrase):
+            score += 3 if key == "premium_amount" else 0
+        if any(token in year_units for token in phrase):
+            score += 3 if key != "premium_amount" else 0
+        if key == "payout_timing" and any(token in {"baad", "बाद", "shuru", "शुरू"} for token in window):
+            score += 2
+        scored.append((score, value))
+
+    best_score = max(score for score, _ in scored)
+    best = [value for score, value in scored if score == best_score]
+    if best_score == 0 or len(best) != 1:
+        return None
+    return best[0]
+
+
 class Flag(str, Enum):
     FD_CONFUSION = "FD_CONFUSION"
     GUARANTEE_CLAIM = "GUARANTEE_CLAIM"
@@ -173,7 +264,9 @@ def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge_re
     fields = {"premium_amount": "premium_amount", "premium_term": "premium_term_years", "policy_term": "policy_term_years", "payout_timing": "payout_start_after_years"}
     if key in fields:
         try:
-            heard = parse_number(answer)
+            heard = extract_number_for_check(key, answer)
+            if heard is None:
+                return CheckResult(key, CheckVerdict.UNCLEAR, answer, mandatory, reason="could not identify one relevant number")
             expected = policy[fields[key]]
             if heard == expected:
                 return CheckResult(key, CheckVerdict.PASS, answer, mandatory)

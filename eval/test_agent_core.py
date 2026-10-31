@@ -5,7 +5,7 @@ import unittest
 from agent.core import (
     CHECK_ORDER, CheckResult, CheckVerdict, CallFlow, Flag, Judge, JudgeResult, Stage,
     VerdictInput, compute_verdict, detect_flags, evaluate_check,
-    evaluate_with_retry, parse_judge_response,
+    evaluate_with_retry, extract_number_for_check, parse_judge_response,
     parse_number,
 )
 
@@ -45,6 +45,50 @@ class NumberParserTests(unittest.TestCase):
         for utterance in ("", "kal", "dedh bees", "lakh", "1 twenty", "bees bees", "1.5.2 lakh", "bees lakh lakh", "saal"):
             with self.subTest(utterance=utterance), self.assertRaises(ValueError):
                 parse_number(utterance)
+
+    def test_natural_sentence_number_extraction(self):
+        cases = [
+            ("premium_amount", "mera premium dedh lakh hai", 150000),
+            ("premium_amount", "हर साल ढाई लाख देने हैं", 250000),
+            ("premium_amount", "ek lakh pachaas hazaar", 150000),
+            ("premium_term", "bees saal tak dena hai", 20),
+            ("policy_term", "policy tees saal chalegi", 30),
+            ("payout_timing", "pension paanch saal baad shuru hogi", 5),
+            ("premium_amount", "मेरा प्रीमियम डेढ़ लाख है", 150000),
+            ("premium_term", "प्रीमियम पाँच साल तक भरना है", 5),
+        ]
+        for key, utterance, expected in cases:
+            with self.subTest(key=key, utterance=utterance):
+                self.assertEqual(extract_number_for_check(key, utterance), expected)
+
+    def test_natural_sentence_ambiguity_is_unclear(self):
+        cases = [
+            ("premium_amount", "premium dedh lakh ya dhai lakh hai"),
+            ("premium_term", "premium paanch saal ya das saal bharna hai"),
+            ("policy_term", "policy bees saal ya tees saal chalegi"),
+            ("payout_timing", "pension paanch saal ya das saal baad shuru hogi"),
+            ("premium_amount", "premium itna hai aur 5 saal dena hai"),
+        ]
+        for key, utterance in cases:
+            with self.subTest(key=key, utterance=utterance):
+                self.assertIsNone(extract_number_for_check(key, utterance))
+
+    def test_natural_number_evaluation_uses_policy_check(self):
+        policy = {
+            "premium_amount": 150000,
+            "premium_term_years": 5,
+            "policy_term_years": 30,
+            "payout_start_after_years": 5,
+        }
+        answers = {
+            "premium_amount": "mera premium dedh lakh hai",
+            "premium_term": "har saal paanch saal dene hain",
+            "policy_term": "policy tees saal chalegi",
+            "payout_timing": "pension paanch saal baad shuru hogi",
+        }
+        for key, answer in answers.items():
+            with self.subTest(key=key):
+                self.assertEqual(evaluate_check(key, answer, policy).verdict, CheckVerdict.PASS)
 
 
 class FlagTests(unittest.TestCase):
