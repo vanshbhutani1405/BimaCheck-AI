@@ -244,6 +244,8 @@ class CheckVerdict(str, Enum):
     PASS = "pass"
     FAIL = "fail"
     UNCLEAR = "unclear"
+    REFUSED = "refused"
+    PENDING = "pending"
     PASS_AFTER_RETRY = "pass_after_retry"
 
 
@@ -255,12 +257,20 @@ class CheckResult:
     mandatory: bool
     retries: int = 0
     reason: str = ""
+    answer_id: str | None = None
 
 
 def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge_result: "JudgeResult | None" = None) -> CheckResult:
     mandatory = key in MANDATORY_CHECKS
     if not answer.strip():
         return CheckResult(key, CheckVerdict.UNCLEAR, answer, mandatory, reason="empty answer")
+    normalized = answer.casefold()
+    if any(phrase in normalized for phrase in (
+        "main nahi batana", "main nahin batana", "nahi batana chahta", "nahin batana chahta",
+        "main nahi dena", "main nahin dena", "जानकारी नहीं देना", "जानकारी नहीं बताना",
+        "नहीं बताना चाहता", "नहीं देना चाहता", "i refuse", "i don't want to answer",
+    )):
+        return CheckResult(key, CheckVerdict.REFUSED, answer, mandatory, reason="customer refused to provide the answer")
     fields = {"premium_amount": "premium_amount", "premium_term": "premium_term_years", "policy_term": "policy_term_years", "payout_timing": "payout_start_after_years"}
     if key in fields:
         try:
@@ -303,7 +313,7 @@ async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, 
         return evaluate_check(key, answer, policy)
 
     result = await evaluate(first_answer)
-    if result.verdict == CheckVerdict.PASS:
+    if result.verdict in {CheckVerdict.PASS, CheckVerdict.REFUSED}:
         return result, None
     retry_answer = await get_retry()
     retry = await evaluate(retry_answer)

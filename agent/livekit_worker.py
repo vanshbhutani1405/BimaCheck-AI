@@ -17,7 +17,8 @@ import logging
 from contextlib import suppress
 from typing import Any, Callable, Mapping, Protocol
 
-from agent.core import Judge, VerdictInput, compute_verdict
+from agent.compliance import VerificationEngine
+from agent.core import Judge
 from agent.workflow import CallWorkflow, LiveKitGnaniConfig, WorkflowResult, normalize_tts_text
 from agent.session import SessionContext, SessionStatus
 from agent.policy import load_policy
@@ -287,8 +288,8 @@ async def run_workflow_session(
     except SessionClosed:
         logger.info("workflow_ended_with_session_disconnect")
         call_session.close()
-        verdict, hold = compute_verdict(VerdictInput(checks={}, unresolved_failure=True))
-        return WorkflowResult(verdict, hold)
+        report = VerificationEngine().calculate_verdict(session=call_session)
+        return WorkflowResult(report.verdict, report.hold_status)
     except Exception:
         logger.exception("workflow_raised_exception")
         raise

@@ -15,8 +15,8 @@ from typing import Any, Mapping, Protocol
 from agent.core import (
     CHECK_ORDER, MANDATORY_CHECKS, CallFlow, CheckResult, CheckVerdict, Flag,
     Judge, Stage, VerdictInput, compute_verdict, detect_flags,
-    evaluate_with_retry,
 )
+from agent.compliance import VerificationEngine, is_confirmed_risk
 from agent.session import ConsentStatus, SessionContext, SessionStatus
 from agent.policy import Policy
 
@@ -205,6 +205,7 @@ class CallWorkflow:
         self._last_customer_message_id: str | None = None
         self._last_answer_id: str | None = None
         self._answer_ids_by_check: dict[str, list[str]] = {}
+        self.verifier = VerificationEngine()
 
     async def _say(self, line: str) -> None:
         logger.info("workflow_response_generated", extra={"text_length": len(line)})
@@ -218,7 +219,13 @@ class CallWorkflow:
         await self.io.publish({"type": "transcript", "session_id": self.session.session_id, "role": "customer", "text": answer, "final": True, "ts_ms": 0})
         for flag, quote in detect_flags(answer):
             self.flags.add(flag)
-            self.session.add_risk_flag(flag.value, quote, message_id=self._last_customer_message_id)
+            self.session.add_risk_flag(
+                flag.value,
+                quote,
+                message_id=self._last_customer_message_id,
+                reason="approved_python_pattern" if is_confirmed_risk(flag, quote) else "python_detected_requires_compliance_review",
+                confirmed=is_confirmed_risk(flag, quote),
+            )
             await self.io.publish({"type": "flag", "session_id": self.session.session_id, "flag": flag.value, "quote": quote, "ts_ms": 0})
         return answer
 
@@ -273,7 +280,18 @@ class CallWorkflow:
         name = str(self.customer.get("name", ""))
         name_variants = self.customer.get("name_variants", ())
         expected_names = (name, *tuple(str(value) for value in name_variants))
-        confirmed = any(candidate and candidate.casefold() in identity.casefold() for candidate in expected_names)
+        identity_result = None
+        if isinstance(self.policy, Policy):
+            identity_result = self.verifier.evaluate_answer(
+                session=self.session,
+                policy=self.policy,
+                check_id="identity",
+                answer_id=self._last_answer_id,
+                customer=self.customer,
+            )
+        confirmed = identity_result.verdict == CheckVerdict.PASS if identity_result is not None else any(candidate and candidate.casefold() in identity.casefold() for candidate in expected_names)
+        if identity_result is not None:
+            self.checks["identity"] = identity_result
         self.flow.advance("identity", accepted=confirmed)
         if self._last_answer_id:
             self.session.update_answer_status(self._last_answer_id, "pass" if confirmed else "fail")
@@ -321,12 +339,33 @@ class CallWorkflow:
                 await self._say(retry_prompt)
                 return await self._answer_for_prompt(retry_prompt, verification_check_id=key, attempt_number=2)
             explanation = re_explanation_for(key, self.policy)
-            result, _retry_prompt = await evaluate_with_retry(
-                key, first, self.policy,
-                re_explanation=explanation,
-                get_retry=retry_answer,
-                judge=self.judge,
-            )
+            if isinstance(self.policy, Policy):
+                result = self.verifier.evaluate_answer(
+                    session=self.session,
+                    policy=self.policy,
+                    check_id=key,
+                    answer_id=self._answer_ids_by_check[key][0],
+                )
+                if result.verdict not in {CheckVerdict.PASS, CheckVerdict.REFUSED}:
+                    await retry_answer()
+                    result = self.verifier.evaluate_answer(
+                        session=self.session,
+                        policy=self.policy,
+                        check_id=key,
+                        answer_id=self._answer_ids_by_check[key][-1],
+                    )
+                    result.retries = 1
+                    if result.verdict == CheckVerdict.PASS:
+                        result.verdict = CheckVerdict.PASS_AFTER_RETRY
+                        self.session.update_answer_status(self._answer_ids_by_check[key][-1], result.verdict.value)
+            else:
+                from agent.core import evaluate_with_retry
+                result, _retry_prompt = await evaluate_with_retry(
+                    key, first, self.policy,
+                    re_explanation=explanation,
+                    get_retry=retry_answer,
+                    judge=self.judge,
+                )
             logger.info("workflow_check_evaluated", extra={"check": key, "verdict": result.verdict.value, "retries": result.retries})
             self.checks[key] = result
             self.session.update_verification_result(key, result, resolved=result.verdict in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY})
@@ -339,16 +378,27 @@ class CallWorkflow:
             self.session.set_stage(self.flow.stage.value)
             logger.info("workflow_stage_after", extra={"stage": self.flow.stage.value, "check": key})
 
-        verdict, hold = compute_verdict(VerdictInput(checks=self.checks, flags=self.flags))
+        if isinstance(self.policy, Policy):
+            report = self.verifier.calculate_verdict(session=self.session)
+            verdict, hold = report.verdict, report.hold_status
+            reasons = list(report.reason_codes)
+        else:
+            verdict, hold = compute_verdict(VerdictInput(checks=self.checks, flags=self.flags))
+            reasons = [k for k, c in self.checks.items() if c.verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}]
         await self._say(PROMPTS["wrap_green"] if verdict == "green" else PROMPTS["human"])
-        await self.io.publish({"type": "verdict", "session_id": self.session.session_id, "verdict": verdict, "reasons": [k for k, c in self.checks.items() if c.verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}], "hold_status": hold})
+        await self.io.publish({"type": "verdict", "session_id": self.session.session_id, "verdict": verdict, "reasons": reasons, "hold_status": hold})
         self.session.complete(human_handoff=verdict != "green")
         return WorkflowResult(verdict, hold, self.checks, self.flags)
 
     async def _finish(self, *, consent_refused: bool = False, unresolved_failure: bool = False) -> WorkflowResult:
-        verdict, hold = compute_verdict(VerdictInput(checks=self.checks, flags=self.flags, consent_refused=consent_refused, unresolved_failure=unresolved_failure))
-        await self.io.publish({"type": "verdict", "session_id": self.session.session_id, "verdict": verdict, "reasons": ["consent_refused"] if consent_refused else ["identity_or_fact_unresolved"], "hold_status": hold})
         self.session.complete(human_handoff=True)
+        if isinstance(self.policy, Policy):
+            report = self.verifier.calculate_verdict(session=self.session)
+            verdict, hold, reasons = report.verdict, report.hold_status, list(report.reason_codes)
+        else:
+            verdict, hold = compute_verdict(VerdictInput(checks=self.checks, flags=self.flags, consent_refused=consent_refused, unresolved_failure=unresolved_failure))
+            reasons = ["consent_refused"] if consent_refused else ["identity_or_fact_unresolved"]
+        await self.io.publish({"type": "verdict", "session_id": self.session.session_id, "verdict": verdict, "reasons": reasons, "hold_status": hold})
         return WorkflowResult(verdict, hold, self.checks, self.flags, consent_refused)
 
 

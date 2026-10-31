@@ -72,6 +72,7 @@ class RiskEvidence:
     timestamp: datetime
     message_id: str | None = None
     reason: str | None = None
+    confirmed: bool = False
 
 
 @dataclass
@@ -273,10 +274,10 @@ class SessionContext:
             self.unresolved_checks.add(check_id)
             self.completed_checks.discard(check_id)
 
-    def add_risk_flag(self, flag: str, evidence: str, *, message_id: str | None = None, reason: str | None = None) -> None:
+    def add_risk_flag(self, flag: str, evidence: str, *, message_id: str | None = None, reason: str | None = None, confirmed: bool = False) -> None:
         if not flag:
             raise ValueError("flag must not be empty")
-        self.risk_flags.append(RiskEvidence(flag, evidence, _utc_now(), message_id, reason))
+        self.risk_flags.append(RiskEvidence(flag, evidence, _utc_now(), message_id, reason, confirmed))
 
     def disclose_policy_fact(self, fact_id: str, *, message_id: str | None = None) -> None:
         if not fact_id:
