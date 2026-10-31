@@ -152,6 +152,11 @@ class SessionContext:
         """Return the pending question without changing it during a side turn."""
         return self.pending_question
 
+    def recent_messages(self, limit: int = 12) -> tuple[ConversationMessage, ...]:
+        if limit < 1:
+            raise ValueError("history limit must be positive")
+        return tuple(self.conversation_history[-limit:])
+
     def request_clarification(self, *, question_id: str) -> None:
         pending = self._require_pending(question_id)
         if pending.answered:
