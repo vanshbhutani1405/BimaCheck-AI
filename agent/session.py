@@ -84,6 +84,11 @@ class SessionContext:
     current_stage: str = "connect"
     completed: bool = False
     human_handoff: bool = False
+    handoff_reason: str | None = None
+    handoff_message_id: str | None = None
+    end_call_requested: bool = False
+    end_call_reason: str | None = None
+    end_call_message_id: str | None = None
     consent_status: ConsentStatus = ConsentStatus.UNKNOWN
     pending_question: PendingQuestion | None = None
     conversation_history: list[ConversationMessage] = field(default_factory=list)
@@ -95,6 +100,7 @@ class SessionContext:
     unresolved_checks: set[str] = field(default_factory=set)
     risk_flags: list[RiskEvidence] = field(default_factory=list)
     disclosed_policy_facts: set[str] = field(default_factory=set)
+    policy_fact_disclosure_messages: dict[str, set[str]] = field(default_factory=dict)
     _answer_index: dict[str, AnswerEvidence] = field(default_factory=dict, repr=False)
 
     def start(self) -> None:
@@ -127,6 +133,25 @@ class SessionContext:
         self.completed = True
         self.status = SessionStatus.CLOSED
         self.pending_question = None
+
+    def request_handoff(self, reason: str, *, message_id: str | None = None) -> None:
+        if not reason.strip():
+            raise ValueError("handoff reason must not be empty")
+        if self.status != SessionStatus.ACTIVE:
+            raise ValueError(f"cannot hand off session in {self.status.value} state")
+        self.handoff_reason = reason
+        self.handoff_message_id = message_id
+        self.complete(human_handoff=True)
+
+    def request_end_call(self, reason: str, *, message_id: str | None = None) -> None:
+        if not reason.strip():
+            raise ValueError("end-call reason must not be empty")
+        if self.status != SessionStatus.ACTIVE:
+            raise ValueError(f"cannot end session in {self.status.value} state")
+        self.end_call_requested = True
+        self.end_call_reason = reason
+        self.end_call_message_id = message_id
+        self.complete(human_handoff=False)
 
     def set_pending_question(self, text: str, *, verification_check_id: str | None = None, question_id: str | None = None) -> PendingQuestion:
         if not text.strip():
@@ -194,6 +219,12 @@ class SessionContext:
         )
         return message_id
 
+    def has_message(self, message_id: str, *, speaker: str | None = None) -> bool:
+        return any(
+            message.message_id == message_id and (speaker is None or message.speaker == speaker)
+            for message in self.conversation_history
+        )
+
     def record_answer(
         self,
         verification_check_id: str,
@@ -247,7 +278,9 @@ class SessionContext:
             raise ValueError("flag must not be empty")
         self.risk_flags.append(RiskEvidence(flag, evidence, _utc_now(), message_id, reason))
 
-    def disclose_policy_fact(self, fact_id: str) -> None:
+    def disclose_policy_fact(self, fact_id: str, *, message_id: str | None = None) -> None:
         if not fact_id:
             raise ValueError("fact_id must not be empty")
         self.disclosed_policy_facts.add(fact_id)
+        if message_id is not None:
+            self.policy_fact_disclosure_messages.setdefault(fact_id, set()).add(message_id)
