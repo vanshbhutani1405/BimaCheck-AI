@@ -102,6 +102,7 @@ class SessionContext:
     risk_flags: list[RiskEvidence] = field(default_factory=list)
     disclosed_policy_facts: set[str] = field(default_factory=set)
     policy_fact_disclosure_messages: dict[str, set[str]] = field(default_factory=dict)
+    final_verdict: dict[str, Any] | None = None
     _answer_index: dict[str, AnswerEvidence] = field(default_factory=dict, repr=False)
 
     def start(self) -> None:
@@ -285,3 +286,8 @@ class SessionContext:
         self.disclosed_policy_facts.add(fact_id)
         if message_id is not None:
             self.policy_fact_disclosure_messages.setdefault(fact_id, set()).add(message_id)
+
+    def store_final_verdict(self, report: Mapping[str, Any]) -> dict[str, Any]:
+        if self.final_verdict is None:
+            self.final_verdict = dict(report)
+        return dict(self.final_verdict)

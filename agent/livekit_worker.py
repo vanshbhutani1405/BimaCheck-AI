@@ -1,4 +1,4 @@
-"""LiveKit integration boundary for the deterministic BimaCheck workflow.
+"""LiveKit integration boundary for the BimaCheck voice workflows.
 
 The workflow deliberately consumes a small session port instead of importing
 LiveKit throughout the decision logic. A deployment adapter owns the concrete
@@ -7,7 +7,7 @@ cancellation, provider selection, and cleanup around CallWorkflow.
 
 The room/audio-track binding uses the installed LiveKit Agents 1.8.10
 AgentSession API. The SessionPort remains the seam that keeps provider calls
-out of the deterministic workflow.
+out of the conversational workflow.
 """
 from __future__ import annotations
 
@@ -18,10 +18,12 @@ from contextlib import suppress
 from typing import Any, Callable, Mapping, Protocol
 
 from agent.compliance import VerificationEngine
+from agent.conversation_agent import GeminiConversationAgent
 from agent.core import Judge
 from agent.workflow import CallWorkflow, LiveKitGnaniConfig, WorkflowResult, normalize_tts_text
 from agent.session import SessionContext, SessionStatus
-from agent.policy import load_policy
+from agent.policy import Policy, load_policy
+from agent.voice_workflow import ConversationalCallWorkflow
 
 
 logger = logging.getLogger(__name__)
@@ -212,7 +214,7 @@ def create_livekit_server(call_data_loader: Callable[[Any], tuple[Mapping[str, A
     @server.rtc_session(agent_name="bimacheck")
     async def entrypoint(ctx: JobContext) -> None:
         customer, policy = call_data_loader(ctx)
-        await run_workflow_session(
+        await run_conversational_session(
             LiveKitAgentSessionPort(ctx.room), customer, policy, on_started=ctx.connect
         )
 
@@ -307,6 +309,67 @@ async def run_workflow_session(
                 call_session.close()
 
 
+async def run_conversational_session(
+    session: SessionPort,
+    customer: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    on_started: Callable[[], Any] | None = None,
+    session_context: SessionContext | None = None,
+) -> dict[str, Any]:
+    """Start the Gemini/Gnani path and finalize one call safely."""
+    call_session = session_context or SessionContext()
+    io = LiveKitSessionIO(session)
+    try:
+        if not isinstance(policy, Policy):
+            raise TypeError("conversational voice path requires a validated Policy")
+        if call_session.status == SessionStatus.CREATED:
+            call_session.start()
+        providers = LiveKitGnaniConfig.build()
+        await session.start(stt=providers["stt"], tts=providers["tts"])
+        if on_started is not None:
+            await on_started()
+        agent = GeminiConversationAgent.from_environment()
+        return await ConversationalCallWorkflow(io, customer, policy, call_session, agent).run()
+    except SessionClosed:
+        logger.info("conversational_workflow_ended_with_session_disconnect")
+        call_session.close()
+        report = VerificationEngine().calculate_verdict(session=call_session)
+        return call_session.store_final_verdict(report.as_dict())
+    except asyncio.CancelledError:
+        logger.warning("conversational_workflow_cancelled", exc_info=True)
+        raise
+    except Exception:
+        logger.exception("conversational_workflow_failed")
+        if call_session.final_verdict is None:
+            call_session.close()
+            report = VerificationEngine().calculate_verdict(session=call_session)
+            call_session.store_final_verdict(report.as_dict())
+        raise
+    finally:
+        try:
+            await io.stop_playback()
+        except Exception:
+            logger.exception("conversational_playback_cleanup_failed")
+        finally:
+            try:
+                await session.close()
+            except Exception:
+                logger.exception("conversational_session_cleanup_failed")
+            if not call_session.completed:
+                call_session.close()
+            if call_session.final_verdict is None:
+                try:
+                    report = VerificationEngine().calculate_verdict(session=call_session)
+                    call_session.store_final_verdict(report.as_dict())
+                except Exception:
+                    logger.exception("conversational_verdict_finalization_failed")
+
+
 def provider_configuration() -> dict[str, Any]:
     """Construct the existing Gnani configuration without making a network call."""
     return LiveKitGnaniConfig.build()
+
+
+if __name__ == "__main__":
+    run_worker()
