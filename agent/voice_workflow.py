@@ -114,7 +114,8 @@ class ConversationalCallWorkflow:
         prompt = PROMPTS[check_id]
         question = self.session.set_pending_question(prompt, verification_check_id=check_id)
         await self._speak(prompt)
-        for attempt in (1, 2):
+        attempt = 1
+        while attempt <= 2:
             transcript, response, execution = await self._turn(pending_check=check_id, attempt=attempt)
             if execution is not None and execution.tool_name == "record_answer" and execution.success:
                 status = execution.data.get("verification_status")
@@ -143,6 +144,7 @@ class ConversationalCallWorkflow:
                     return
                 if attempt == 1:
                     await self._speak(PROMPTS["retry"].format(explanation=re_explanation_for(check_id, self.policy)))
+                    attempt = 2
                     continue
                 self.session.resolve_pending_question(question_id=question.question_id)
                 if check_id == "identity":
@@ -169,6 +171,10 @@ class ConversationalCallWorkflow:
                     customer=self.customer,
                 )
                 return
+            # Customer questions, clarification requests, interruptions and
+            # unrelated turns are conversational side turns, not verification
+            # attempts. Keep the same Python-owned attempt number and pending
+            # question until a record_answer operation succeeds.
             await self._speak(question.text)
 
     async def _finalize(self) -> dict[str, Any]:

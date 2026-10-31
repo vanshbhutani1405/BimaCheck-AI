@@ -64,6 +64,7 @@ class LiveKitAgentSessionPort:
         self._agent_factory = agent_factory
         self._session: Any | None = None
         self._transcripts: asyncio.Queue[str | None] = asyncio.Queue()
+        self._queued_transcripts: set[str] = set()
         self._active = False
         self._close_signal_sent = False
         self._turn_commit_tasks: set[asyncio.Task[None]] = set()
@@ -104,6 +105,7 @@ class LiveKitAgentSessionPort:
         if transcript is None:
             logger.info("transcript_queue_interrupted_by_session_close")
             raise SessionClosed("LiveKit AgentSession closed before a final transcript")
+        self._queued_transcripts.discard(transcript)
         logger.info("transcript_retrieved_from_queue", extra={"text_length": len(transcript)})
         return transcript
 
@@ -127,6 +129,10 @@ class LiveKitAgentSessionPort:
                 logger.info("empty_committed_turn_ignored")
                 return
             transcript = committed_transcript
+        if transcript in self._queued_transcripts:
+            logger.info("duplicate_final_transcript_ignored", extra={"text_length": len(transcript)})
+            return
+        self._queued_transcripts.add(transcript)
         self._transcripts.put_nowait(transcript)
         logger.info("transcript_added_to_queue", extra={"queue_size": self._transcripts.qsize()})
 
@@ -189,6 +195,7 @@ class LiveKitAgentSessionPort:
             with suppress(asyncio.CancelledError):
                 await task
         self._turn_commit_tasks.clear()
+        self._queued_transcripts.clear()
         if self._session is not None:
             if self._active:
                 logger.info("session_shutdown_started", extra={"reason": "application_cleanup"})

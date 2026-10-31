@@ -279,7 +279,7 @@ class WorkerTests(unittest.TestCase):
         session.listen = disconnected_listen
         with patch("agent.livekit_worker.LiveKitGnaniConfig.build", return_value={"stt": "stt", "tts": "tts"}):
             result = asyncio.run(run_workflow_session(session, {"name": "Asha"}, {}))
-        self.assertEqual((result.verdict, result.hold_status), ("red", "hold"))
+        self.assertEqual((result.verdict, result.hold_status), ("amber", "pending_review"))
         self.assertEqual(session.closed, 1)
 
     def test_cleanup_failure_does_not_mask_workflow_exception(self):

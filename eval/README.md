@@ -1,5 +1,20 @@
 # Evaluation baseline
 
+The evaluation directory now contains both the original `unittest` coverage
+and pytest coverage for the GO 6.5 component and mocked integration seams.
+Run the complete suite after reviewing the implementation with:
+
+```powershell
+python -m pytest
+```
+
+Individual modules can be run with, for example:
+
+```powershell
+python -m pytest eval/test_compliance_pytest.py
+python -m pytest eval/test_voice_workflow_pytest.py
+```
+
 This directory contains reproducible local tests and will hold measured evidence. No live provider call or benchmark is performed by the unit tests.
 
 ## Evidence status
