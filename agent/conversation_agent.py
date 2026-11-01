@@ -10,16 +10,30 @@ import inspect
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-from agent.conversation_prompt import SYSTEM_PROMPT
+from agent.conversation_prompt import RESPONSE_JSON_SCHEMA, SYSTEM_PROMPT
 from agent.policy import Policy
 from agent.session import SessionContext
 
 
 logger = logging.getLogger(__name__)
+MAX_DIAGNOSTIC_SAMPLE = 240
+
+
+def _diagnostic_sample(value: Any) -> str:
+    """Return a bounded, control-character-safe sample without secrets."""
+    text = value if isinstance(value, str) else repr(value)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"(?i)(authorization|api[_-]?key|secret|token)\s*[:=]\s*[^,}\s]+", r"\1=<redacted>", text)
+    return text[:MAX_DIAGNOSTIC_SAMPLE]
+
+
+RESPONSE_FIELDS = frozenset(RESPONSE_JSON_SCHEMA["required"])
 
 
 class ConversationIntent(str, Enum):
@@ -140,20 +154,30 @@ class GeminiConversationAgent:
         if not isinstance(customer_message, str) or not customer_message.strip():
             return self._fallback("empty customer message")
         prompt = self._build_turn_prompt(session, customer_message, policy, customer_context, relevant_fact_ids)
+        started = time.perf_counter()
+        logger.info("gemini_conversation_request_started", extra={"model": self.settings.model, "message_length": len(customer_message)})
         try:
             raw = await asyncio.wait_for(self._request(prompt), timeout=self.settings.timeout_seconds)
+            logger.info(
+                "gemini_conversation_request_completed",
+                extra={"model": self.settings.model, "response_length": len(raw), "duration_ms": round((time.perf_counter() - started) * 1000, 1)},
+            )
             return self.parse_response(raw)
         except asyncio.TimeoutError:
-            logger.warning("gemini_conversation_timeout", extra={"model": self.settings.model})
+            logger.warning("gemini_conversation_timeout", extra={"model": self.settings.model, "duration_ms": round((time.perf_counter() - started) * 1000, 1)})
             return self._fallback("provider timeout")
-        except Exception:
-            logger.exception("gemini_conversation_failed", extra={"model": self.settings.model})
+        except Exception as exc:
+            logger.exception(
+                "gemini_conversation_failed",
+                extra={"model": self.settings.model, "error_type": type(exc).__name__, "duration_ms": round((time.perf_counter() - started) * 1000, 1)},
+            )
             return self._fallback("provider failure")
 
     async def _request(self, prompt: str) -> str:
         """Run one standalone LiveKit Inference chat request and collect text."""
         from livekit.agents import APIConnectOptions, ChatContext
 
+        started = time.perf_counter()
         chat_ctx = ChatContext()
         chat_ctx.add_message(role="system", content=SYSTEM_PROMPT)
         chat_ctx.add_message(role="user", content=prompt)
@@ -166,9 +190,13 @@ class GeminiConversationAgent:
             ),
         )
         chunks: list[str] = []
+        chunk_count = 0
+        content_types: set[str] = set()
         try:
             async for chunk in stream:
+                chunk_count += 1
                 content = getattr(getattr(chunk, "delta", None), "content", None)
+                content_types.add(type(content).__name__)
                 if isinstance(content, str) and content:
                     chunks.append(content)
         finally:
@@ -178,7 +206,21 @@ class GeminiConversationAgent:
                 if inspect.isawaitable(result):
                     await result
         raw = "".join(chunks)
+        logger.info(
+            "gemini_inference_response_extracted",
+            extra={
+                "stream_type": type(stream).__name__,
+                "chunk_count": chunk_count,
+                "content_types": tuple(sorted(content_types)),
+                "text_length": len(raw),
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            },
+        )
         if not raw.strip():
+            logger.warning(
+                "gemini_response_extraction_failed",
+                extra={"reason": "empty_text_after_stream", "chunk_count": chunk_count},
+            )
             raise ValueError("LiveKit Inference returned no text")
         return raw
 
@@ -236,19 +278,36 @@ class GeminiConversationAgent:
     @classmethod
     def parse_response(cls, raw: Any) -> ConversationResponse:
         if not isinstance(raw, str) or not raw.strip():
+            logger.warning("gemini_response_parsing_failed", extra={"reason": "empty_or_non_string"})
             raise ValueError("Gemini returned an empty response")
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if len(lines) < 3 or not lines[-1].strip().startswith("```"):
+                logger.warning("gemini_response_parsing_failed", extra={"reason": "unterminated_code_fence", "sample": _diagnostic_sample(text)})
+                raise ValueError("Gemini response had an unterminated JSON code fence")
+            text = "\n".join(lines[1:-1]).strip()
         try:
-            payload = json.loads(raw)
+            payload = json.loads(text)
         except (TypeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "gemini_response_parsing_failed",
+                extra={"reason": "invalid_json", "sample": _diagnostic_sample(text)},
+            )
             raise ValueError("Gemini response was not valid JSON") from exc
         if not isinstance(payload, dict):
+            logger.warning("gemini_response_validation_failed", extra={"reason": "response_not_object"})
             raise ValueError("Gemini response must be an object")
-        required = {
-            "spoken_response", "intent", "conversation_action", "tool_proposal",
-            "requires_clarification", "clarification_reason", "answer_candidate",
-            "policy_fact_ids", "handoff_requested", "end_call_requested",
-        }
-        if set(payload) != required:
+        actual_fields = set(payload)
+        if actual_fields != RESPONSE_FIELDS:
+            logger.warning(
+                "gemini_response_schema_validation_failed",
+                extra={
+                    "missing_fields": tuple(sorted(RESPONSE_FIELDS - actual_fields)),
+                    "unexpected_fields": tuple(sorted(actual_fields - RESPONSE_FIELDS)),
+                    "sample": _diagnostic_sample(text),
+                },
+            )
             raise ValueError("Gemini response fields do not match the response contract")
         spoken = payload["spoken_response"]
         if not isinstance(spoken, str) or not spoken.strip() or len(spoken) > 1000:

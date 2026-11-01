@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -35,6 +37,11 @@ def test_structured_response_is_strictly_parsed():
     assert response.conversation_action == ConversationAction.PROPOSE_RECORD_ANSWER
 
 
+def test_json_code_fence_is_normalized_without_relaxing_schema():
+    response = GeminiConversationAgent.parse_response("```json\n" + response_payload() + "\n```")
+    assert response.intent == ConversationIntent.ANSWER
+
+
 @pytest.mark.parametrize("raw", ["not json", "{}", response_payload(intent="not-valid")])
 def test_malformed_response_is_rejected(raw):
     with pytest.raises(ValueError):
@@ -67,3 +74,42 @@ async def test_provider_exception_returns_safe_fallback(bound_policy, session):
     assert response.intent == ConversationIntent.UNKNOWN
     assert response.requires_clarification is True
     assert "समझ" in response.spoken_response
+
+
+@pytest.mark.asyncio
+async def test_livekit_stream_chunks_are_aggregated_in_order(monkeypatch, bound_policy, session):
+    class FakeChatContext:
+        def add_message(self, **kwargs):
+            pass
+
+    class FakeConnectOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeStream:
+        def __init__(self):
+            self.closed = False
+
+        def __aiter__(self):
+            async def chunks():
+                for part in (response_payload()[:80], response_payload()[80:]):
+                    yield types.SimpleNamespace(delta=types.SimpleNamespace(content=part))
+            return chunks()
+
+        async def aclose(self):
+            self.closed = True
+
+    class FakeLLM:
+        def __init__(self):
+            self.stream = FakeStream()
+
+        def chat(self, **kwargs):
+            return self.stream
+
+    fake_agents = types.ModuleType("livekit.agents")
+    fake_agents.APIConnectOptions = FakeConnectOptions
+    fake_agents.ChatContext = FakeChatContext
+    monkeypatch.setitem(sys.modules, "livekit.agents", fake_agents)
+    agent = GeminiConversationAgent(FakeLLM(), GeminiSettings(timeout_seconds=1))
+    raw = await agent._request("{}")
+    assert json.loads(raw)["intent"] == "answer"

@@ -27,7 +27,16 @@ Use a short spoken response and one question at a time. Be respectful when
 the customer is confused or refuses. Do not invent guarantees, returns,
 benefits, dates, exclusions, grace periods, revival terms or payout rules.
 
-Return only the requested JSON object. Do not add Markdown or commentary.
+Return exactly one JSON object with these exact keys and no others:
+spoken_response, intent, conversation_action, tool_proposal,
+requires_clarification, clarification_reason, answer_candidate,
+policy_fact_ids, handoff_requested, end_call_requested.
+Use the declared enum values for intent and conversation_action. Use null for
+clarification_reason, answer_candidate or tool_proposal when they do not
+apply. Use an array of strings for policy_fact_ids and booleans for the three
+boolean fields. A tool_proposal must contain only name and arguments, and the
+name must be one of the approved Python tools. Return no Markdown fences or
+commentary outside the JSON object.
 """.strip()
 
 
