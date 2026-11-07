@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import suppress
 from typing import Any, Callable, Mapping, Protocol
 
@@ -68,6 +69,7 @@ class LiveKitAgentSessionPort:
         self._active = False
         self._close_signal_sent = False
         self._turn_commit_tasks: set[asyncio.Task[None]] = set()
+        self._last_transcript_at: float | None = None
 
     async def start(self, *, stt: Any, tts: Any) -> None:
         if self._session_factory is None or self._agent_factory is None:
@@ -76,10 +78,18 @@ class LiveKitAgentSessionPort:
         else:
             session_factory, agent_factory = self._session_factory, self._agent_factory
         self._session = session_factory(stt=stt, tts=tts, allow_interruptions=True)
+        logger.info("voice_session_transport_created", extra={"stt_type": type(stt).__name__, "tts_type": type(tts).__name__})
 
         @self._session.on("user_input_transcribed")
         def on_transcript(event: Any) -> None:
-            logger.info("final_transcript_event_received", extra={"is_final": bool(event.is_final), "text_length": len(event.transcript)})
+            logger.info(
+                "final_transcript_event_received",
+                extra={
+                    "is_final": bool(event.is_final),
+                    "text_length": len(event.transcript),
+                    "seconds_since_last_transcript": round(time.monotonic() - self._last_transcript_at, 2) if self._last_transcript_at else None,
+                },
+            )
             if event.is_final:
                 task = asyncio.create_task(self._commit_then_queue(event.transcript))
                 self._turn_commit_tasks.add(task)
@@ -99,6 +109,7 @@ class LiveKitAgentSessionPort:
         )
         self._active = True
         self._close_signal_sent = False
+        logger.info("voice_session_started")
 
     async def listen(self) -> str:
         transcript = await self._transcripts.get()
@@ -122,18 +133,24 @@ class LiveKitAgentSessionPort:
         session = self._session
         commit_user_turn = getattr(session, "commit_user_turn", None)
         if callable(commit_user_turn):
-            committed = commit_user_turn(transcript_timeout=0.0, skip_reply=True)
-            committed_transcript = await committed
-            logger.info("user_turn_committed_before_queue", extra={"text_length": len(transcript)})
-            if not committed_transcript or not committed_transcript.strip():
-                logger.info("empty_committed_turn_ignored")
-                return
-            transcript = committed_transcript
+            try:
+                committed = commit_user_turn(transcript_timeout=0.0, skip_reply=True)
+                committed_transcript = await committed
+                logger.info("user_turn_committed_before_queue", extra={"text_length": len(transcript)})
+                if not committed_transcript or not committed_transcript.strip():
+                    logger.info("empty_committed_turn_ignored")
+                    return
+                transcript = committed_transcript
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("user_turn_commit_failed_using_final_transcript", extra={"text_length": len(transcript)})
         if transcript in self._queued_transcripts:
             logger.info("duplicate_final_transcript_ignored", extra={"text_length": len(transcript)})
             return
         self._queued_transcripts.add(transcript)
         self._transcripts.put_nowait(transcript)
+        self._last_transcript_at = time.monotonic()
         logger.info("transcript_added_to_queue", extra={"queue_size": self._transcripts.qsize()})
 
     async def speak(self, text: str) -> None:
@@ -242,7 +259,7 @@ class LiveKitSessionIO:
         self._playback_task: asyncio.Task[None] | None = None
 
     async def speak(self, text: str) -> None:
-        await self.stop_playback()
+        await self.stop_playback(interrupt_transport=False)
         normalized = normalize_tts_text(text)
         self._playback_task = asyncio.create_task(self.session.speak(normalized))
         try:
@@ -255,14 +272,15 @@ class LiveKitSessionIO:
     async def listen(self) -> str:
         return await self.session.listen()
 
-    async def stop_playback(self) -> None:
+    async def stop_playback(self, *, interrupt_transport: bool = True) -> None:
         task = self._playback_task
         self._playback_task = None
         if task is not None and not task.done():
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
-        await self.session.stop_playback()
+        if interrupt_transport:
+            await self.session.stop_playback()
 
     async def publish(self, event: Mapping[str, Any]) -> None:
         await self.session.publish(dict(event))
@@ -337,7 +355,13 @@ async def run_conversational_session(
         if on_started is not None:
             await on_started()
         agent = GeminiConversationAgent.from_environment()
-        return await ConversationalCallWorkflow(io, customer, policy, call_session, agent).run()
+        logger.info("conversational_workflow_started", extra={"session_id": call_session.session_id})
+        result = await ConversationalCallWorkflow(io, customer, policy, call_session, agent).run()
+        if call_session.workflow_complete:
+            logger.info("conversational_workflow_completed", extra={"session_id": call_session.session_id, "verdict": result.get("verdict")})
+        else:
+            logger.info("conversational_workflow_terminated_before_completion", extra={"session_id": call_session.session_id, "verdict": result.get("verdict")})
+        return result
     except SessionClosed:
         logger.info("conversational_workflow_ended_with_session_disconnect")
         call_session.close()

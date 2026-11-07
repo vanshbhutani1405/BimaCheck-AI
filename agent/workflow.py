@@ -42,6 +42,7 @@ PROMPTS = {
 }
 
 REEXPLANATIONS = {
+    "identity": "policyholder ka naam record ke mutabik saaf-saaf batayein",
     "premium_amount": "record mein diya gaya annual premium",
     "premium_term": "premium har saal record mein diye gaye saalon tak dena hai",
     "policy_term": "policy record mein diye gaye poore term tak chalegi",
@@ -100,7 +101,7 @@ def re_explanation_for(key: str, policy: Mapping[str, Any]) -> str:
         return f"pension {format_policy_value(policy['payout_start_after_years'], kind='duration')} baad shuru hogi"
     if key == "stop_paying" and policy.get("stop_paying_explanation"):
         return f"record ke mutabik, {policy['stop_paying_explanation']}"
-    return REEXPLANATIONS[key]
+    return REEXPLANATIONS.get(key, "is sawaal ka jawab record ke mutabik apne shabdon mein batayein")
 
 
 class VoiceIO(Protocol):

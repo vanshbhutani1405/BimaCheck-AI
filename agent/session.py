@@ -84,6 +84,13 @@ class SessionContext:
     status: SessionStatus = SessionStatus.CREATED
     current_stage: str = "connect"
     completed: bool = False
+    # These lifecycle markers are Python-owned.  They are deliberately
+    # separate from the final verdict because an Amber verdict can describe
+    # either an incomplete terminal call or a fully evaluated call requiring
+    # review.
+    identity_verified: bool = False
+    policy_explanation_completed: bool = False
+    workflow_complete: bool = False
     human_handoff: bool = False
     handoff_reason: str | None = None
     handoff_message_id: str | None = None

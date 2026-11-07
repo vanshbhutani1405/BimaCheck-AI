@@ -90,3 +90,28 @@ def test_execute_proposal_uses_allowlist(bound_policy, session):
         proposal=ToolProposal("unknown", {}), session=session, policy=bound_policy
     )
     assert result.success is False and result.error_code == "unknown_tool"
+
+
+def test_record_answer_rejects_missing_and_unknown_argument_fields(bound_policy, customer, session):
+    executor = ToolExecutor()
+    missing = executor.execute(
+        tool_name="record_answer",
+        session=session,
+        policy=bound_policy,
+        customer=customer,
+        arguments={"check_id": "premium_amount", "answer_candidate": "डेढ़ लाख"},
+    )
+    unknown = executor.execute(
+        tool_name="record_answer",
+        session=session,
+        policy=bound_policy,
+        customer=customer,
+        arguments={
+            "check_id": "premium_amount",
+            "answer_candidate": "डेढ़ लाख",
+            "original_transcript": "डेढ़ लाख",
+            "unexpected": True,
+        },
+    )
+    assert missing.success is False and "original_transcript" in missing.error_message
+    assert unknown.success is False and "unexpected" in unknown.error_message

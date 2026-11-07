@@ -70,6 +70,13 @@ ALLOWED_TOOL_NAMES = frozenset({
     "end_call",
 })
 
+_INTENT_ALIASES = {
+    "affirmation": ConversationIntent.ANSWER.value,
+}
+_ACTION_ALIASES = {
+    "continue_verification": ConversationAction.RESPOND.value,
+}
+
 
 @dataclass(frozen=True)
 class ToolProposal:
@@ -152,7 +159,7 @@ class GeminiConversationAgent:
         relevant_fact_ids: Sequence[str] = (),
     ) -> ConversationResponse:
         if not isinstance(customer_message, str) or not customer_message.strip():
-            return self._fallback("empty customer message")
+            return self._fallback("empty customer message", session=session)
         prompt = self._build_turn_prompt(session, customer_message, policy, customer_context, relevant_fact_ids)
         started = time.perf_counter()
         logger.info("gemini_conversation_request_started", extra={"model": self.settings.model, "message_length": len(customer_message)})
@@ -165,13 +172,13 @@ class GeminiConversationAgent:
             return self.parse_response(raw)
         except asyncio.TimeoutError:
             logger.warning("gemini_conversation_timeout", extra={"model": self.settings.model, "duration_ms": round((time.perf_counter() - started) * 1000, 1)})
-            return self._fallback("provider timeout")
+            return self._fallback("provider timeout", session=session)
         except Exception as exc:
             logger.exception(
                 "gemini_conversation_failed",
                 extra={"model": self.settings.model, "error_type": type(exc).__name__, "duration_ms": round((time.perf_counter() - started) * 1000, 1)},
             )
-            return self._fallback("provider failure")
+            return self._fallback("provider failure", session=session)
 
     async def _request(self, prompt: str) -> str:
         """Run one standalone LiveKit Inference chat request and collect text."""
@@ -264,6 +271,7 @@ class GeminiConversationAgent:
             "clarification_required": pending.clarification_required,
         }
         return json.dumps({
+            "current_stage": session.current_stage,
             "customer_message": customer_message,
             "customer_context": {
                 key: customer_context[key]
@@ -312,11 +320,24 @@ class GeminiConversationAgent:
         spoken = payload["spoken_response"]
         if not isinstance(spoken, str) or not spoken.strip() or len(spoken) > 1000:
             raise ValueError("spoken_response must be a non-empty string under 1000 characters")
-        try:
-            intent = ConversationIntent(payload["intent"])
-            action = ConversationAction(payload["conversation_action"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Gemini response contains an unsupported intent or action") from exc
+        intent_value, intent_aliased = cls._normalize_enum_value(
+            payload["intent"], ConversationIntent, _INTENT_ALIASES, "intent"
+        )
+        action_value, action_aliased = cls._normalize_enum_value(
+            payload["conversation_action"], ConversationAction, _ACTION_ALIASES, "conversation_action"
+        )
+        intent = ConversationIntent(intent_value)
+        action = ConversationAction(action_value)
+        if intent_aliased or action_aliased:
+            logger.info(
+                "gemini_enum_normalized",
+                extra={
+                    "intent": intent.value,
+                    "intent_alias_used": intent_aliased,
+                    "action": action.value,
+                    "action_alias_used": action_aliased,
+                },
+            )
         if not isinstance(payload["requires_clarification"], bool) or not isinstance(payload["handoff_requested"], bool) or not isinstance(payload["end_call_requested"], bool):
             raise ValueError("Gemini response boolean fields are invalid")
         if payload["clarification_reason"] is not None and not isinstance(payload["clarification_reason"], str):
@@ -350,10 +371,47 @@ class GeminiConversationAgent:
         )
 
     @staticmethod
-    def _fallback(reason: str) -> ConversationResponse:
-        logger.info("gemini_safe_fallback", extra={"reason": reason})
+    def _normalize_enum_value(
+        value: Any,
+        enum_type: type[Enum],
+        aliases: Mapping[str, str],
+        field_name: str,
+    ) -> tuple[str, bool]:
+        if not isinstance(value, str):
+            logger.warning(
+                "gemini_enum_unsupported",
+                extra={"field": field_name, "raw_value": _diagnostic_sample(value), "reason": "not_string"},
+            )
+            raise ValueError(f"Gemini {field_name} must be a string")
+        normalized = value.strip().casefold()
+        try:
+            enum_type(normalized)
+            return normalized, False
+        except ValueError:
+            alias = aliases.get(normalized)
+            if alias is not None:
+                return alias, True
+            logger.warning(
+                "gemini_enum_unsupported",
+                extra={"field": field_name, "raw_value": _diagnostic_sample(value), "reason": "unknown_value"},
+            )
+            raise ValueError(f"Gemini response contains an unsupported {field_name}: {value!r}")
+
+    @staticmethod
+    def _fallback(reason: str, *, session: SessionContext | None = None) -> ConversationResponse:
+        pending = session.get_pending_question() if session is not None else None
+        if pending is not None and pending.text.strip():
+            spoken = f"माफ़ कीजिए। कृपया इस सवाल का जवाब दीजिए: {pending.text}"
+        elif session is not None and session.current_stage == "identity":
+            spoken = "माफ़ कीजिए। कृपया अपना नाम एक बार फिर बताइए।"
+        else:
+            spoken = "माफ़ कीजिए, मैं आपकी बात समझ नहीं पाया। कृपया फिर से बताइए।"
+        logger.info(
+            "gemini_safe_fallback",
+            extra={"reason": reason, "stage": session.current_stage if session is not None else None, "has_pending_question": pending is not None},
+        )
         return ConversationResponse(
-            spoken_response="मुझे आपकी बात पूरी तरह समझ नहीं आई। कृपया अपना जवाब एक बार फिर बताइए।",
+            spoken_response=spoken,
             intent=ConversationIntent.UNKNOWN,
             conversation_action=ConversationAction.REQUEST_CLARIFICATION,
             tool_proposal=None,

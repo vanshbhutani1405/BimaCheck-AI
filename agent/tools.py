@@ -19,6 +19,13 @@ from agent.session import SessionContext, SessionStatus
 logger = logging.getLogger(__name__)
 _CHECK_IDS = frozenset((IDENTITY_CHECK_ID, *CHECK_ORDER))
 _RISK_FLAGS = frozenset(flag.value for flag in Flag)
+_TOOL_ARGUMENTS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
+    "record_answer": (frozenset({"check_id", "answer_candidate", "original_transcript", "message_id", "normalized_answer", "attempt_number"}), frozenset({"check_id", "answer_candidate", "original_transcript"})),
+    "get_policy_fact": (frozenset({"fact_id", "section", "verification_check_id", "used_in_response", "response_message_id"}), frozenset()),
+    "flag_risk": (frozenset({"flag", "evidence", "message_id", "reason"}), frozenset({"flag", "evidence"})),
+    "handoff_to_human": (frozenset({"reason", "message_id"}), frozenset({"reason"})),
+    "end_call": (frozenset({"reason", "confirmation", "message_id"}), frozenset({"reason", "confirmation"})),
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,25 @@ def _optional_message(session: SessionContext, message_id: Any, *, speaker: str 
     if not isinstance(message_id, str) or not session.has_message(message_id, speaker=speaker):
         raise ValueError("message_id must reference a message in this session")
     return message_id
+
+
+def _validate_tool_arguments(tool_name: str, arguments: Mapping[str, Any]) -> None:
+    allowed, required = _TOOL_ARGUMENTS[tool_name]
+    unknown = set(arguments) - allowed
+    if unknown:
+        raise ValueError(f"unsupported argument field(s): {', '.join(sorted(unknown))}")
+    missing = required - set(arguments)
+    if missing:
+        raise ValueError(f"missing required argument field(s): {', '.join(sorted(missing))}")
+    for field in ("check_id", "answer_candidate", "original_transcript", "flag", "evidence", "reason", "fact_id", "section", "verification_check_id"):
+        if field in arguments and not isinstance(arguments[field], str):
+            raise TypeError(f"argument {field} must be a string")
+    if "attempt_number" in arguments and (not isinstance(arguments["attempt_number"], int) or isinstance(arguments["attempt_number"], bool)):
+        raise TypeError("argument attempt_number must be an integer")
+    if "confirmation" in arguments and not isinstance(arguments["confirmation"], bool):
+        raise TypeError("argument confirmation must be a boolean")
+    if "used_in_response" in arguments and not isinstance(arguments["used_in_response"], bool):
+        raise TypeError("argument used_in_response must be a boolean")
 
 
 def record_answer(
@@ -119,6 +145,7 @@ def record_answer(
                 policy=policy,
                 check_id=check_id,
                 answer_id=answer_id,
+                customer=customer,
             )
             return _success(tool_name, session, recorded=True, duplicate=False, answer_id=answer_id, verification_status=result.verdict.value)
         return _success(tool_name, session, recorded=True, duplicate=False, answer_id=answer_id, verification_status="unverified")
@@ -259,6 +286,11 @@ class ToolExecutor:
         if not isinstance(arguments, Mapping):
             return _failure(tool_name, session, "invalid_arguments", "tool arguments must be an object")
         kwargs = dict(arguments)
+        try:
+            _validate_tool_arguments(tool_name, kwargs)
+        except (TypeError, ValueError) as exc:
+            logger.warning("tool_argument_validation_failed", extra={"tool": tool_name, "reason": str(exc)})
+            return _failure(tool_name, session, "invalid_arguments", str(exc))
         if tool_name == "get_policy_fact":
             if policy is None:
                 return _failure(tool_name, session, "missing_policy", "validated policy is required")

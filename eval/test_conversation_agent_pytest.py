@@ -11,10 +11,11 @@ from agent.conversation_agent import (
     ConversationIntent,
     GeminiConversationAgent,
     GeminiSettings,
+    RESPONSE_FIELDS,
 )
 
 
-def response_payload(**overrides):
+def response_payload(*, action=None, **overrides):
     payload = {
         "spoken_response": "जी, कृपया अपना जवाब बताइए।",
         "intent": "answer",
@@ -27,14 +28,44 @@ def response_payload(**overrides):
         "handoff_requested": False,
         "end_call_requested": False,
     }
+    if action is not None:
+        overrides["conversation_action"] = action
     payload.update(overrides)
     return json.dumps(payload, ensure_ascii=False)
 
 
 def test_structured_response_is_strictly_parsed():
-    response = GeminiConversationAgent.parse_response(response_payload())
+    raw = response_payload()
+    assert set(json.loads(raw)) == RESPONSE_FIELDS
+    response = GeminiConversationAgent.parse_response(raw)
     assert response.intent == ConversationIntent.ANSWER
     assert response.conversation_action == ConversationAction.PROPOSE_RECORD_ANSWER
+
+
+@pytest.mark.parametrize("intent", [value.value for value in ConversationIntent])
+def test_every_supported_intent_parses(intent):
+    assert GeminiConversationAgent.parse_response(response_payload(intent=intent)).intent.value == intent
+
+
+@pytest.mark.parametrize("action", [value.value for value in ConversationAction])
+def test_every_supported_action_parses(action):
+    assert GeminiConversationAgent.parse_response(response_payload(action=action)).conversation_action.value == action
+
+
+def test_natural_enum_aliases_are_explicitly_normalized():
+    response = GeminiConversationAgent.parse_response(
+        response_payload(intent="affirmation", conversation_action="continue_verification")
+    )
+    assert response.intent == ConversationIntent.ANSWER
+    assert response.conversation_action == ConversationAction.RESPOND
+
+
+def test_affirmation_alias_does_not_create_a_tool_or_verification_result():
+    response = GeminiConversationAgent.parse_response(
+        response_payload(intent="affirmation", conversation_action="continue_verification", answer_candidate=None)
+    )
+    assert response.tool_proposal is None
+    assert response.answer_candidate is None
 
 
 def test_json_code_fence_is_normalized_without_relaxing_schema():
@@ -51,6 +82,13 @@ def test_malformed_response_is_rejected(raw):
 def test_response_rejects_unapproved_tool():
     with pytest.raises(ValueError):
         GeminiConversationAgent.parse_response(response_payload(tool_proposal={"name": "set_verdict", "arguments": {}}))
+
+
+def test_unknown_enum_values_are_rejected_without_fabricating_an_action():
+    with pytest.raises(ValueError, match="unsupported intent"):
+        GeminiConversationAgent.parse_response(response_payload(intent="made_up_intent"))
+    with pytest.raises(ValueError, match="unsupported conversation_action"):
+        GeminiConversationAgent.parse_response(response_payload(action="made_up_action"))
 
 
 def test_prompt_contains_pending_question_and_only_minimal_customer_context(bound_policy, customer, session):

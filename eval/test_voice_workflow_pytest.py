@@ -5,17 +5,17 @@ import json
 
 import pytest
 
-from agent.conversation_agent import ConversationAction, ConversationIntent, ConversationResponse
+from agent.conversation_agent import ConversationAction, ConversationIntent, ConversationResponse, ToolProposal
 from agent.livekit_worker import LiveKitAgentSessionPort, run_conversational_session
 from agent.voice_workflow import ConversationalCallWorkflow
 
 
-def response(intent=ConversationIntent.ANSWER, candidate=None, action=ConversationAction.PROPOSE_RECORD_ANSWER):
+def response(intent=ConversationIntent.ANSWER, candidate=None, action=ConversationAction.PROPOSE_RECORD_ANSWER, tool_proposal=None):
     return ConversationResponse(
         spoken_response="जी, धन्यवाद।",
         intent=intent,
         conversation_action=action,
-        tool_proposal=None,
+        tool_proposal=tool_proposal,
         requires_clarification=intent != ConversationIntent.ANSWER,
         clarification_reason=None,
         answer_candidate=candidate,
@@ -69,6 +69,71 @@ async def test_one_check_records_evidence_and_advances_python_workflow(bound_pol
     assert session.answers[0].original_answer == "डेढ़ लाख"
     assert session.pending_question is None
     assert io.events[0]["final"] is True
+
+
+@pytest.mark.asyncio
+async def test_consent_turn_cannot_record_identity_answer(bound_policy, customer, session):
+    io = FakeIO(["जी हाँ।"])
+    agent = FakeConversationAgent([
+        response(
+            candidate="जी हाँ।",
+            tool_proposal=ToolProposal("record_answer", {"check_id": "identity", "answer_candidate": "जी हाँ।"}),
+        )
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    transcript, _, execution = await workflow._turn(pending_check=None)
+    assert transcript == "जी हाँ।"
+    assert execution is None
+    assert session.answers == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_identity_proposal_is_replaced_by_python_arguments(bound_policy, customer, session):
+    io = FakeIO(["वंश"])
+    agent = FakeConversationAgent([
+        response(
+            candidate="वंश",
+            tool_proposal=ToolProposal("record_answer", {"check_id": "identity", "answer": "वंश"}),
+        )
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    workflow.flow.advance("connected")
+    workflow.flow.advance("consent", accepted=True)
+    await workflow._process_check("identity")
+    assert len(session.answers) == 1
+    assert session.answers[0].original_answer == "वंश"
+    assert session.verification_results["identity"].verdict.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_identity_retry_uses_identity_explanation_and_accepts_permitted_variant(bound_policy, customer, session):
+    io = FakeIO(["Ravi", "वंश"])
+    agent = FakeConversationAgent([
+        response(candidate="Ravi"),
+        response(candidate="वंश"),
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    workflow.flow.advance("connected")
+    workflow.flow.advance("consent", accepted=True)
+    await workflow._process_check("identity")
+    assert session.verification_results["identity"].verdict.value == "pass_after_retry"
+    assert session.retry_counts["identity"] == 1
+    assert any("policyholder" in spoken for spoken in io.spoken)
+
+
+@pytest.mark.asyncio
+async def test_identity_confirmation_is_required_before_flow_advances(bound_policy, customer, session):
+    io = FakeIO(["वंश", "हाँ"])
+    agent = FakeConversationAgent([response(candidate="वंश"), response()])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    workflow.flow.advance("connected")
+    workflow.flow.advance("consent", accepted=True)
+    await workflow._process_check("identity", advance=False)
+    assert workflow.flow.stage.value == "identity"
+    assert await workflow._confirm_identity() is True
+    workflow.flow.advance("identity", accepted=True)
+    assert workflow.flow.stage.value == "fact_confirmation"
+    assert any("वंश" in spoken for spoken in io.spoken)
 
 
 @pytest.mark.asyncio
