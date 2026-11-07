@@ -1,0 +1,374 @@
+"""Real-time conversational orchestration above the LiveKit transport seam."""
+from __future__ import annotations
+
+import logging
+from typing import Any, Mapping
+
+from agent.compliance import MANDATORY_VERIFICATION_CHECKS, VerificationEngine
+from agent.conversation_agent import ConversationIntent, ConversationResponse, GeminiConversationAgent, ToolProposal
+from agent.core import CHECK_ORDER, CallFlow, CheckVerdict, detect_flags
+from agent.policy import Policy
+from agent.session import ConsentStatus, SessionContext, SessionStatus
+from agent.tools import ToolExecutionResult, ToolExecutor
+from agent.workflow import VoiceIO, format_policy_value, normalize_tts_text, re_explanation_for
+
+
+logger = logging.getLogger(__name__)
+
+VOICE_PROMPTS = {
+    "disclosure": "नमस्ते! मैं BimaCheck से बात कर रहा हूँ। आपकी insurance policy की कुछ जानकारी verify करनी है। क्या हम शुरू कर सकते हैं?",
+    "identity": "सबसे पहले, क्या मैं आपका नाम जान सकता हूँ?",
+    "identity_confirm": "धन्यवाद। क्या आपका नाम {name} है?",
+    "facts": "आपकी policy {product_name} एक {product_type} pension product है, fixed deposit नहीं। Annual premium {premium_amount} रुपये है और यह premium हर साल {premium_term_years} साल तक भरना है। आपकी policy {policy_term_years} साल तक चलेगी। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension {payout_timing} शुरू होगी। {stop_paying_explanation}। क्या यह जानकारी सही है?",
+    "premium_amount": "आपका annual premium कितना है?",
+    "premium_term": "आपको हर साल premium कितने साल तक भरना होगा?",
+    "policy_term": "आपकी policy कितने साल तक चलेगी?",
+    "product_type": "यह product fixed deposit है या pension product?",
+    "payout_recipient": "Policy record के मुताबिक payout किसे मिलेगा?",
+    "payout_timing": "Pension कब शुरू होगी?",
+    "stop_paying": "अगर आप premium देना बंद कर देते हैं, तो क्या हो सकता है?",
+    "affordability": "क्या यह premium आपकी आमदनी के हिसाब से manageable है?",
+    "retry": "मैं इसे थोड़ा आसान तरीके से समझाता हूँ: {explanation}। अब आप अपने शब्दों में फिर से बताइए।",
+    "human": "धन्यवाद। इस call को human review के लिए भेजा जा रहा है।",
+    "wrap_green": "धन्यवाद। आपकी जानकारी review के लिए दर्ज कर ली गई है।",
+}
+
+
+class ConversationalCallWorkflow:
+    """One customer call driven by Gemini interpretation and Python controls."""
+
+    def __init__(self, io: VoiceIO, customer: Mapping[str, Any], policy: Policy, session: SessionContext, agent: GeminiConversationAgent, *, executor: ToolExecutor | None = None):
+        self.io = io
+        self.customer = customer
+        self.policy = policy
+        self.session = session
+        self.agent = agent
+        self.executor = executor or ToolExecutor()
+        self.verifier = VerificationEngine()
+        self.flow = CallFlow()
+        self._finalized = False
+
+    @staticmethod
+    def _customer_requested_end(transcript: str) -> bool:
+        """Require explicit customer language before honoring end_call."""
+        normalized = transcript.casefold()
+        return any(
+            phrase in normalized
+            for phrase in (
+                "end the call", "stop the call", "call khatam", "call band",
+                "baat khatam", "baat band", "baat nahi karni", "कॉल खत्म",
+                "कॉल बंद", "बात खत्म", "बात बंद", "बात नहीं करनी",
+            )
+        )
+
+    async def _speak(self, text: str) -> None:
+        self.session.add_message("agent", text)
+        await self.io.speak(normalize_tts_text(text))
+
+    async def _listen(self) -> tuple[str, str]:
+        text = await self.io.listen()
+        message_id = self.session.add_message("customer", text)
+        await self.io.publish({
+            "type": "transcript",
+            "session_id": self.session.session_id,
+            "role": "customer",
+            "text": text,
+            "final": True,
+            "ts_ms": 0,
+        })
+        for flag, quote in detect_flags(text):
+            self.executor.execute(
+                tool_name="flag_risk",
+                session=self.session,
+                arguments={"flag": flag.value, "evidence": quote, "message_id": message_id},
+                policy=self.policy,
+                customer=self.customer,
+            )
+        return text, message_id
+
+    async def _turn(self, *, pending_check: str | None, attempt: int = 1) -> tuple[str, ConversationResponse, ToolExecutionResult | None]:
+        transcript, message_id = await self._listen()
+        relevant = ()
+        if pending_check:
+            fact = self.policy.get_fact(verification_check_id=pending_check)
+            relevant = (fact.fact_id,) if fact.exists and fact.fact_id else ()
+        response = await self.agent.respond(
+            session=self.session,
+            customer_message=transcript,
+            policy=self.policy,
+            customer_context=self.customer,
+            relevant_fact_ids=relevant,
+        )
+        proposal = response.tool_proposal
+        if proposal is not None and proposal.name == "record_answer" and pending_check is None:
+            logger.warning(
+                "record_answer_proposal_without_pending_check",
+                extra={"session_id": self.session.session_id},
+            )
+            proposal = None
+        if proposal is not None and proposal.name == "end_call" and not self._customer_requested_end(transcript):
+            logger.warning(
+                "end_call_proposal_without_explicit_customer_request",
+                extra={"session_id": self.session.session_id},
+            )
+            proposal = None
+        if proposal is None and pending_check and response.intent in {ConversationIntent.ANSWER, ConversationIntent.CORRECTION, ConversationIntent.REFUSAL}:
+            proposal = ToolProposal(
+                "record_answer",
+                {
+                    "check_id": pending_check,
+                    "answer_candidate": response.answer_candidate or transcript,
+                    "original_transcript": transcript,
+                    "message_id": message_id,
+                    "attempt_number": attempt,
+                },
+            )
+        elif proposal is None and response.handoff_requested:
+            proposal = ToolProposal("handoff_to_human", {"reason": response.clarification_reason or "human assistance requested", "message_id": message_id})
+        elif proposal is None and response.end_call_requested and self._customer_requested_end(transcript):
+            proposal = ToolProposal("end_call", {"reason": response.clarification_reason or "customer requested the call to end", "confirmation": True, "message_id": message_id})
+
+        execution = None
+        if proposal is not None:
+            arguments = dict(proposal.arguments)
+            if proposal.name == "record_answer" and pending_check:
+                arguments.update({"check_id": pending_check, "original_transcript": transcript, "message_id": message_id, "attempt_number": attempt})
+            elif proposal.name == "flag_risk":
+                arguments.update({"evidence": transcript, "message_id": message_id})
+            elif proposal.name == "handoff_to_human":
+                arguments.setdefault("message_id", message_id)
+            elif proposal.name == "end_call":
+                arguments.setdefault("message_id", message_id)
+            execution = self.executor.execute(
+                tool_name=proposal.name,
+                session=self.session,
+                arguments=arguments,
+                policy=self.policy,
+                customer=self.customer,
+            )
+            if (
+                proposal.name == "record_answer"
+                and not execution.success
+                and pending_check
+                and response.intent in {ConversationIntent.ANSWER, ConversationIntent.CORRECTION, ConversationIntent.REFUSAL}
+            ):
+                logger.warning(
+                    "invalid_record_answer_proposal_replaced_with_python_canonical_arguments",
+                    extra={"session_id": self.session.session_id, "check_id": pending_check, "error_code": execution.error_code},
+                )
+                execution = self.executor.execute(
+                    tool_name="record_answer",
+                    session=self.session,
+                    arguments={
+                        "check_id": pending_check,
+                        "answer_candidate": response.answer_candidate or transcript,
+                        "original_transcript": transcript,
+                        "message_id": message_id,
+                        "attempt_number": attempt,
+                    },
+                    policy=self.policy,
+                    customer=self.customer,
+                )
+        await self._speak(response.spoken_response)
+        for fact_id in response.policy_fact_ids:
+            fact = self.policy.get_fact(fact_id=fact_id)
+            if fact.exists:
+                self.session.disclose_policy_fact(fact_id, message_id=self.session.conversation_history[-1].message_id)
+        return transcript, response, execution
+
+    async def _process_check(self, check_id: str, *, advance: bool = True) -> None:
+        prompt = VOICE_PROMPTS[check_id]
+        question = self.session.set_pending_question(prompt, verification_check_id=check_id)
+        await self._speak(prompt)
+        attempt = 1
+        while attempt <= 2:
+            transcript, response, execution = await self._turn(pending_check=check_id, attempt=attempt)
+            if execution is not None and execution.tool_name == "record_answer" and execution.success:
+                status = execution.data.get("verification_status")
+                result = self.session.verification_results.get(check_id)
+                if status == CheckVerdict.PASS.value:
+                    if attempt == 2 and result is not None:
+                        result.verdict = CheckVerdict.PASS_AFTER_RETRY
+                        result.retries = 1
+                        self.session.update_answer_status(execution.data["answer_id"], result.verdict.value)
+                        self.session.update_verification_result(check_id, result, resolved=True)
+                    self.session.resolve_pending_question(question_id=question.question_id)
+                    if check_id == "identity" and advance:
+                        self.flow.advance("identity", accepted=True)
+                    elif check_id != "identity":
+                        self.flow.advance("check_passed")
+                    self.session.set_stage(self.flow.stage.value)
+                    return
+                if status == CheckVerdict.REFUSED.value:
+                    self.executor.execute(
+                        tool_name="handoff_to_human",
+                        session=self.session,
+                        arguments={"reason": "customer refused a mandatory verification answer", "message_id": self.session.conversation_history[-2].message_id},
+                        policy=self.policy,
+                        customer=self.customer,
+                    )
+                    return
+                if attempt == 1:
+                    await self._speak(VOICE_PROMPTS["retry"].format(explanation=re_explanation_for(check_id, self.policy)))
+                    attempt = 2
+                    continue
+                self.session.resolve_pending_question(question_id=question.question_id)
+                if check_id == "identity":
+                    self.executor.execute(
+                        tool_name="handoff_to_human",
+                        session=self.session,
+                        arguments={"reason": "identity verification failed"},
+                        policy=self.policy,
+                        customer=self.customer,
+                    )
+                    return
+                self.flow.advance("check_passed")
+                self.session.set_stage(self.flow.stage.value)
+                return
+
+            if self.session.status != SessionStatus.ACTIVE:
+                return
+            if response.intent == ConversationIntent.REFUSAL:
+                self.executor.execute(
+                    tool_name="handoff_to_human",
+                    session=self.session,
+                    arguments={"reason": "customer refused verification", "message_id": self.session.conversation_history[-2].message_id},
+                    policy=self.policy,
+                    customer=self.customer,
+                )
+                return
+            # Customer questions, clarification requests, interruptions and
+            # unrelated turns are conversational side turns, not verification
+            # attempts. Keep the same Python-owned attempt number and pending
+            # question until a record_answer operation succeeds.
+            await self._speak(question.text)
+
+    async def _finalize(self) -> dict[str, Any]:
+        if self.session.final_verdict is not None:
+            return dict(self.session.final_verdict)
+        report = self.verifier.calculate_verdict(session=self.session)
+        stored = self.session.store_final_verdict(report.as_dict())
+        lifecycle_complete = (
+            self.session.identity_verified
+            and self.session.policy_explanation_completed
+            and all(check_id in self.session.completed_checks for check_id in MANDATORY_VERIFICATION_CHECKS)
+        )
+        if lifecycle_complete:
+            self.session.workflow_complete = True
+        if lifecycle_complete and self.session.status == SessionStatus.ACTIVE:
+            self.session.complete(human_handoff=report.verdict != "green")
+        await self.io.publish({"type": "verdict", "session_id": self.session.session_id, **stored})
+        self._finalized = True
+        return stored
+
+    async def _confirm_identity(self) -> bool:
+        """Require an explicit customer confirmation after name matching."""
+        variants = self.customer.get("name_variants", ())
+        display_name = next((str(value) for value in variants if str(value).strip()), str(self.customer.get("name", "")))
+        question = self.session.set_pending_question(
+            VOICE_PROMPTS["identity_confirm"].format(name=display_name),
+            verification_check_id="identity_confirmation",
+        )
+        await self._speak(question.text)
+        confirmation, _, _ = await self._turn(pending_check=None)
+        if self.session.status != SessionStatus.ACTIVE:
+            return False
+        self.session.resolve_pending_question(question_id=question.question_id)
+        normalized = confirmation.casefold()
+        refused = any(word in normalized for word in ("nahi", "nahin", "no", "नहीं"))
+        accepted = any(word in normalized for word in ("haan", "ha", "yes", "sahmat", "हाँ", "जी"))
+        if refused or not accepted:
+            return False
+        return True
+
+    async def run(self) -> dict[str, Any]:
+        self.flow.advance("connected")
+        self.session.set_stage(self.flow.stage.value)
+
+        consent_question = self.session.set_pending_question(VOICE_PROMPTS["disclosure"], verification_check_id="consent")
+        await self._speak(VOICE_PROMPTS["disclosure"])
+        consent, response, _ = await self._turn(pending_check=None)
+        if self.session.status != SessionStatus.ACTIVE:
+            return await self._finalize()
+        normalized_consent = consent.casefold()
+        accepted = any(word in normalized_consent for word in ("haan", "ha", "yes", "sahmat", "हाँ", "जी"))
+        refused = any(word in normalized_consent for word in ("nahi", "nahin", "no", "नहीं"))
+        if refused or not accepted:
+            self.session.consent_status = ConsentStatus.REFUSED
+            self.session.resolve_pending_question(question_id=consent_question.question_id)
+            self.executor.execute(
+                tool_name="handoff_to_human",
+                session=self.session,
+                arguments={"reason": "customer did not consent to continue", "message_id": self.session.conversation_history[-2].message_id},
+                policy=self.policy,
+                customer=self.customer,
+            )
+            await self._speak(VOICE_PROMPTS["human"])
+            return await self._finalize()
+        self.session.consent_status = ConsentStatus.GRANTED
+        self.session.resolve_pending_question(question_id=consent_question.question_id)
+        self.flow.advance("consent", accepted=True)
+        self.session.set_stage(self.flow.stage.value)
+
+        await self._process_check("identity", advance=False)
+        if self.session.status != SessionStatus.ACTIVE:
+            return await self._finalize()
+        identity = self.session.verification_results.get("identity")
+        if identity is None or identity.verdict != CheckVerdict.PASS:
+            return await self._finalize()
+
+        if not await self._confirm_identity():
+            self.executor.execute(
+                tool_name="handoff_to_human",
+                session=self.session,
+                arguments={"reason": "customer did not confirm the configured identity"},
+                policy=self.policy,
+                customer=self.customer,
+            )
+            await self._speak(VOICE_PROMPTS["human"])
+            return await self._finalize()
+        self.flow.advance("identity", accepted=True)
+        self.session.identity_verified = True
+        self.session.set_stage(self.flow.stage.value)
+
+        facts = VOICE_PROMPTS["facts"].format(
+            product_name=self.policy["product_name"],
+            premium_amount=format_policy_value(self.policy["premium_amount"], kind="amount"),
+            premium_term_years=format_policy_value(self.policy["premium_term_years"], kind="duration"),
+            policy_term_years=format_policy_value(self.policy["policy_term_years"], kind="duration"),
+            product_type=self.policy["product_type"],
+            payout_recipient=self.policy["payout_recipient"],
+            payout_timing=format_policy_value(self.policy["payout_start_after_years"], kind="duration"),
+            stop_paying_explanation=self.policy["stop_paying_explanation"],
+        )
+        facts_question = self.session.set_pending_question(facts, verification_check_id="facts_confirmation")
+        await self._speak(facts)
+        facts_answer, facts_response, _ = await self._turn(pending_check=None)
+        if self.session.status != SessionStatus.ACTIVE:
+            return await self._finalize()
+        self.session.resolve_pending_question(question_id=facts_question.question_id)
+        if any(word in facts_answer.casefold() for word in ("nahi", "nahin", "galat", "wrong", "नहीं")):
+            self.executor.execute(
+                tool_name="handoff_to_human",
+                session=self.session,
+                arguments={"reason": "customer did not confirm the policy facts"},
+                policy=self.policy,
+                customer=self.customer,
+            )
+            await self._speak(VOICE_PROMPTS["human"])
+            return await self._finalize()
+        self.flow.advance("facts_confirmed")
+        self.session.policy_explanation_completed = True
+        self.session.set_stage(self.flow.stage.value)
+
+        for check_id in CHECK_ORDER:
+            # Affordability remains an advisory Python evaluation, not one of
+            # the seven mandatory customer comprehension questions.
+            if check_id == "affordability":
+                continue
+            await self._process_check(check_id)
+            if self.session.status != SessionStatus.ACTIVE:
+                break
+        report = await self._finalize()
+        await self._speak(VOICE_PROMPTS["wrap_green"] if report["verdict"] == "green" else VOICE_PROMPTS["human"])
+        return report
