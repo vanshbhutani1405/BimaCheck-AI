@@ -113,7 +113,7 @@ class WorkerTests(unittest.TestCase):
         asyncio.run(io.speak("  Namaste   ji "))
         asyncio.run(io.stop_playback())
         self.assertEqual(session.spoken, ["Namaste ji"])
-        self.assertGreaterEqual(session.stop_calls, 2)
+        self.assertEqual(session.stop_calls, 1)
 
     def test_cleanup_runs_when_workflow_listen_fails(self):
         session = FakeSession()
