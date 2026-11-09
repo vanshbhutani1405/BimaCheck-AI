@@ -10,7 +10,7 @@ from agent.livekit_worker import LiveKitAgentSessionPort, run_conversational_ses
 from agent.voice_workflow import VOICE_PROMPTS, ConversationalCallWorkflow
 
 
-def response(intent=ConversationIntent.ANSWER, candidate=None, action=ConversationAction.PROPOSE_RECORD_ANSWER, tool_proposal=None, spoken="जी, धन्यवाद।"):
+def response(intent=ConversationIntent.ANSWER, candidate=None, action=ConversationAction.PROPOSE_RECORD_ANSWER, tool_proposal=None, spoken="जी, धन्यवाद।", handoff=False, end_call=False):
     return ConversationResponse(
         spoken_response=spoken,
         intent=intent,
@@ -20,8 +20,8 @@ def response(intent=ConversationIntent.ANSWER, candidate=None, action=Conversati
         clarification_reason=None,
         answer_candidate=candidate,
         policy_fact_ids=(),
-        handoff_requested=False,
-        end_call_requested=False,
+        handoff_requested=handoff,
+        end_call_requested=end_call,
     )
 
 
@@ -309,10 +309,15 @@ async def test_repeated_policy_questions_do_not_exhaust_retry(bound_policy, cust
 
 @pytest.mark.asyncio
 async def test_genuine_incorrect_answer_consumes_one_retry_before_correction(bound_policy, customer, session):
-    io = FakeIO(["दो लाख", "डेढ़ लाख"])
+    io = FakeIO(["1,00,000", "1,50,000 है"])
     agent = FakeConversationAgent([
-        response(candidate="दो लाख"),
-        response(candidate="डेढ़ लाख"),
+        response(candidate="1,00,000"),
+        response(
+            candidate="1,50,000 है",
+            action=ConversationAction.PROPOSE_HANDOFF,
+            tool_proposal=ToolProposal("handoff_to_human", {"reason": "Gemini misclassified retry"}),
+            handoff=True,
+        ),
     ])
     workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
     enter_comprehension(workflow)
@@ -321,6 +326,8 @@ async def test_genuine_incorrect_answer_consumes_one_retry_before_correction(bou
     assert session.retry_counts["premium_amount"] == 1
     assert session.verification_results["premium_amount"].verdict.value == "pass_after_retry"
     assert workflow.flow.current_check == "premium_term"
+    assert session.human_handoff is False
+    assert session.end_call_requested is False
 
 
 @pytest.mark.parametrize("wrong_answer", ["दस साल", "1,00,000"])
@@ -347,6 +354,8 @@ async def test_failed_premium_amount_retries_once_and_does_not_advance(
     assert workflow.flow.current_check == "premium_amount"
     assert "premium_amount" not in session.completed_checks
     assert all("policy term" not in text for text in workflow.io.spoken)
+    assert session.human_handoff is True
+    assert session.end_call_requested is False
 
 
 @pytest.mark.asyncio

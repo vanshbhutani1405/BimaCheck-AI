@@ -114,22 +114,29 @@ class ConversationalCallWorkflow:
                 extra={"session_id": self.session.session_id},
             )
             proposal = None
-        preserve_control_action = (
-            response.handoff_requested
-            or (proposal is not None and proposal.name in {"handoff_to_human", "end_call"})
-            or (response.end_call_requested and self._customer_requested_end(transcript))
+        current_mandatory_answer = (
+            pending_check is not None
+            and pending_check == self.flow.current_check
+            and response.intent in {
+                ConversationIntent.ANSWER,
+                ConversationIntent.CORRECTION,
+                ConversationIntent.REFUSAL,
+            }
+        )
+        explicit_end_call = (
+            (response.end_call_requested or (proposal is not None and proposal.name == "end_call"))
+            and self._customer_requested_end(transcript)
+        )
+        preserve_control_action = explicit_end_call or (
+            not current_mandatory_answer
+            and (
+                response.handoff_requested
+                or (proposal is not None and proposal.name in {"handoff_to_human", "end_call"})
+            )
         )
         python_evaluates_turn = (
             pending_check == "identity"
-            or (
-                pending_check is not None
-                and pending_check == self.flow.current_check
-                and response.intent in {
-                    ConversationIntent.ANSWER,
-                    ConversationIntent.CORRECTION,
-                    ConversationIntent.REFUSAL,
-                }
-            )
+            or current_mandatory_answer
         )
         if python_evaluates_turn and not preserve_control_action:
             # The pending Python check owns evaluation. Gemini's intent cannot

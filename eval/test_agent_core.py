@@ -90,6 +90,17 @@ class NumberParserTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(evaluate_check(key, answer, policy).verdict, CheckVerdict.PASS)
 
+    def test_premium_amount_accepts_equivalent_digit_formats_and_hindi_words(self):
+        policy = {"premium_amount": 150000}
+        for answer in (
+            "1,50,000", "1,50,000 है", "₹1,50,000", "150000",
+            "एक लाख पचास हजार", "एक लाख पचास हजार है",
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(evaluate_check("premium_amount", answer, policy).verdict, CheckVerdict.PASS)
+
+        self.assertEqual(evaluate_check("premium_amount", "1,00,000", policy).verdict, CheckVerdict.FAIL)
+
 
 class FlagTests(unittest.TestCase):
     def test_positives_roman_and_devanagari(self):
