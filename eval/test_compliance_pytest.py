@@ -22,6 +22,19 @@ def test_identity_and_numeric_answers_are_authoritatively_evaluated(bound_policy
     assert _complete_check(session, bound_policy, "policy_term", "बीस साल").verdict == CheckVerdict.PASS
 
 
+def test_payout_recipient_matches_configured_name_in_supported_scripts(bound_policy, session):
+    for answer in ("सुनीता", "सुनीता को मिलेगा", "Sunita", "Sunita को मिलेगा", "Policy payout सुनीता को मिलेगा"):
+        isolated = type(session)()
+        isolated.start()
+        result = _complete_check(isolated, bound_policy, "payout_recipient", answer)
+        assert result.verdict == CheckVerdict.PASS
+
+    unmatched = type(session)()
+    unmatched.start()
+    result = _complete_check(unmatched, bound_policy, "payout_recipient", "असुनीता को मिलेगा")
+    assert result.verdict != CheckVerdict.PASS
+
+
 def test_unclear_and_refused_answers_do_not_complete_check(bound_policy, session):
     unclear = _complete_check(session, bound_policy, "premium_amount", "लगभग उतना ही")
     assert unclear.verdict == CheckVerdict.UNCLEAR

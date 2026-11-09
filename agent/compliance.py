@@ -47,6 +47,20 @@ def _quote(answer: str, token: str) -> str:
     return answer[index:index + len(token)] if index >= 0 else answer
 
 
+_RECIPIENT_SCRIPT_VARIANTS = {"sunita": ("सुनीता",)}
+
+
+def _recipient_mention(answer: str, recipient: str) -> str | None:
+    """Match the configured recipient as a whole name in a supported script."""
+    aliases = (recipient, *_RECIPIENT_SCRIPT_VARIANTS.get(recipient.casefold(), ()))
+    for alias in aliases:
+        pattern = rf"(?<![\w\u0900-\u097f]){re.escape(alias)}(?![\w\u0900-\u097f])"
+        match = re.search(pattern, answer, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return None
+
+
 def _deterministic_judge(key: str, answer: str, policy: Policy) -> JudgeResult:
     normalized = answer.casefold()
     if key == "product_type":
@@ -57,8 +71,9 @@ def _deterministic_judge(key: str, answer: str, policy: Policy) -> JudgeResult:
         return JudgeResult("unclear", "", "product type was not clear")
     if key == "payout_recipient":
         recipient = str(policy.get("payout_recipient") or "")
-        if recipient and recipient.casefold() in normalized:
-            return JudgeResult("correct", recipient, "approved payout recipient was identified")
+        mention = _recipient_mention(answer, recipient) if recipient else None
+        if mention:
+            return JudgeResult("correct", mention, "approved payout recipient was identified")
         if any(term in normalized for term in ("mujhe", "mere", "खुद", "मुझे", "myself")):
             return JudgeResult("incorrect", answer, "customer named a recipient different from the approved recipient")
         return JudgeResult("unclear", "", "payout recipient was not clear")

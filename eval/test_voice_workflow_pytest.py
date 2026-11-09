@@ -176,7 +176,7 @@ async def test_fresh_identity_turn_hides_expected_name_from_gemini_and_speech(bo
 async def test_identity_confirmation_advances_to_policy_facts_and_first_check(bound_policy, customer, session):
     replies = [
         "हाँ", "वंश", "हाँ", "हाँ", "डेढ़ लाख", "पाँच साल", "बीस साल",
-        "pension", "Sunita", "पाँच साल बाद", "policy lapse ho sakti hai",
+        "pension", "सुनीता को मिलेगा", "पाँच साल बाद", "policy lapse ho sakti hai",
     ]
     responses = [response() for _ in replies]
     responses[1] = response(ConversationIntent.UNKNOWN, action=ConversationAction.REQUEST_CLARIFICATION)
@@ -199,6 +199,26 @@ async def test_identity_confirmation_advances_to_policy_facts_and_first_check(bo
         if call["pending_check"] in mandatory_sequence
     ]
     assert spoken_checks == mandatory_sequence
+
+
+@pytest.mark.parametrize("recipient_answer", ["सुनीता", "सुनीता को मिलेगा", "Sunita", "Sunita को मिलेगा"])
+@pytest.mark.asyncio
+async def test_payout_recipient_in_supported_script_passes_without_retry(
+    bound_policy, customer, session, recipient_answer
+):
+    io = FakeIO([recipient_answer])
+    agent = FakeConversationAgent([response(candidate=recipient_answer)])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    enter_comprehension(workflow)
+    for _ in range(4):
+        workflow.flow.advance("check_passed")
+
+    await workflow._process_check("payout_recipient")
+
+    assert session.verification_results["payout_recipient"].verdict.value == "pass"
+    assert len(session.answers) == 1
+    assert workflow.flow.current_check == "payout_timing"
+    assert not any("थोड़ा आसान" in spoken for spoken in io.spoken)
 
 
 @pytest.mark.asyncio
