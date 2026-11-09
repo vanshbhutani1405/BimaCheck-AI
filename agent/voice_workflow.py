@@ -29,9 +29,27 @@ VOICE_PROMPTS = {
     "stop_paying": "अगर आप premium देना बंद कर देते हैं, तो क्या हो सकता है?",
     "affordability": "क्या यह premium आपकी आमदनी के हिसाब से manageable है?",
     "retry": "मैं इसे थोड़ा आसान तरीके से समझाता हूँ: {explanation}। अब आप अपने शब्दों में फिर से बताइए।",
+    "discrepancy": "Record के मुताबिक {record_value}। आपने {heard} बताया है, इसलिए इसे review के लिए note कर रहा हूँ। चलिए बाकी जानकारी भी verify करते हैं।",
+    "unclear": "मैं आपका जवाब साफ़ नहीं समझ पाया। इसे review के लिए note कर रहा हूँ। चलिए बाकी जानकारी भी verify करते हैं।",
     "human": "धन्यवाद। इस call को human review के लिए भेजा जा रहा है।",
     "wrap_green": "धन्यवाद। आपकी जानकारी review के लिए दर्ज कर ली गई है।",
 }
+
+
+def _record_value_for(check_id: str, policy: Mapping[str, Any]) -> str:
+    if check_id == "premium_amount":
+        return f"annual premium {format_policy_value(policy['premium_amount'], kind='amount')} रुपये है"
+    if check_id == "premium_term":
+        return f"premium हर साल {format_policy_value(policy['premium_term_years'], kind='duration')} तक भरना है"
+    if check_id == "policy_term":
+        return f"policy {format_policy_value(policy['policy_term_years'], kind='duration')} तक चलेगी"
+    if check_id == "product_type":
+        return f"यह {policy['product_type']} है"
+    if check_id == "payout_recipient":
+        return f"payout {policy['payout_recipient']} को मिलेगा"
+    if check_id == "payout_timing":
+        return f"pension {format_policy_value(policy['payout_start_after_years'], kind='duration')} बाद शुरू होगी"
+    return str(policy["stop_paying_explanation"])
 
 
 class ConversationalCallWorkflow:
@@ -114,21 +132,23 @@ class ConversationalCallWorkflow:
                 extra={"session_id": self.session.session_id},
             )
             proposal = None
+        in_mandatory_check = pending_check is not None and pending_check == self.flow.current_check
         current_mandatory_answer = (
-            pending_check is not None
-            and pending_check == self.flow.current_check
-            and response.intent in {
-                ConversationIntent.ANSWER,
-                ConversationIntent.CORRECTION,
-                ConversationIntent.REFUSAL,
-            }
+            in_mandatory_check
+            and response.intent not in {ConversationIntent.CUSTOMER_QUESTION, ConversationIntent.CLARIFICATION, ConversationIntent.UNRELATED}
         )
         explicit_end_call = (
             (response.end_call_requested or (proposal is not None and proposal.name == "end_call"))
             and self._customer_requested_end(transcript)
         )
+        if in_mandatory_check and not explicit_end_call:
+            if proposal is not None and proposal.name in {"handoff_to_human", "end_call"}:
+                proposal = None
+            if not current_mandatory_answer and proposal is not None and proposal.name == "record_answer":
+                proposal = None
         preserve_control_action = explicit_end_call or (
-            not current_mandatory_answer
+            pending_check != "identity"
+            and not in_mandatory_check
             and (
                 response.handoff_requested
                 or (proposal is not None and proposal.name in {"handoff_to_human", "end_call"})
@@ -163,7 +183,7 @@ class ConversationalCallWorkflow:
                     "attempt_number": attempt,
                 },
             )
-        elif proposal is None and response.handoff_requested:
+        elif proposal is None and response.handoff_requested and not in_mandatory_check:
             proposal = ToolProposal("handoff_to_human", {"reason": response.clarification_reason or "human assistance requested", "message_id": message_id})
         elif proposal is None and response.end_call_requested and self._customer_requested_end(transcript):
             proposal = ToolProposal("end_call", {"reason": response.clarification_reason or "customer requested the call to end", "confirmation": True, "message_id": message_id})
@@ -268,14 +288,18 @@ class ConversationalCallWorkflow:
                         self.flow.advance("check_passed")
                     self.session.set_stage(self.flow.stage.value)
                     return
-                if status == CheckVerdict.REFUSED.value:
-                    self.executor.execute(
-                        tool_name="handoff_to_human",
-                        session=self.session,
-                        arguments={"reason": "customer refused a mandatory verification answer", "message_id": self.session.conversation_history[-2].message_id},
-                        policy=self.policy,
-                        customer=self.customer,
-                    )
+                if check_id != "identity":
+                    self.session.resolve_pending_question(question_id=question.question_id)
+                    if result is not None:
+                        self.session.update_verification_result(check_id, result, resolved=True)
+                    if status == CheckVerdict.FAIL.value and result is not None:
+                        await self._speak(VOICE_PROMPTS["discrepancy"].format(
+                            record_value=_record_value_for(check_id, self.policy), heard=transcript
+                        ))
+                    else:
+                        await self._speak(VOICE_PROMPTS["unclear"])
+                    self.flow.advance("check_passed")
+                    self.session.set_stage(self.flow.stage.value)
                     return
                 if attempt == 1:
                     await self._speak(VOICE_PROMPTS["retry"].format(explanation=re_explanation_for(check_id, self.policy)))
@@ -448,5 +472,22 @@ class ConversationalCallWorkflow:
                 # never enter a later mandatory check.
                 break
         report = await self._finalize()
-        await self._speak(VOICE_PROMPTS["wrap_green"] if report["verdict"] == "green" else VOICE_PROMPTS["human"])
+        if report["verdict"] == "green":
+            await self._speak("आपका verification पूरा हो गया है। आपकी दी गई सभी जानकारी policy record से match हुई है। Verification सफल रहा।")
+        elif self.session.workflow_complete:
+            labels = {
+                "premium_amount": "annual premium", "premium_term": "premium भरने की अवधि",
+                "policy_term": "policy की अवधि", "product_type": "product type",
+                "payout_recipient": "payout पाने वाला", "payout_timing": "pension शुरू होने का समय",
+                "stop_paying": "premium रोकने के परिणाम",
+            }
+            discrepancies = [labels[key] for key in report.get("mandatory_completed", ())
+                             if key in labels and key in self.session.verification_results
+                             and self.session.verification_results[key].verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}]
+            if discrepancies:
+                await self._speak(f"आपका verification पूरा हो गया है। ये जानकारियाँ policy record से match नहीं हुईं: {', '.join(discrepancies)}। इसलिए इस case को human review के लिए भेजा जा रहा है।")
+            else:
+                await self._speak(VOICE_PROMPTS["human"])
+        else:
+            await self._speak(VOICE_PROMPTS["human"])
         return report

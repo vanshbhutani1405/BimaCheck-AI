@@ -323,7 +323,8 @@ def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge_re
     return CheckResult(key, verdict, answer, mandatory, reason=judge_result.reason)
 
 
-async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, Any], *, re_explanation: str, get_retry: Callable[[], Awaitable[str]], judge: "Judge | None" = None) -> tuple[CheckResult, str | None]:
+async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, Any], *, re_explanation: str = "", get_retry: Callable[[], Awaitable[str]] | None = None, judge: "Judge | None" = None) -> tuple[CheckResult, str | None]:
+    """Evaluate the single answer for a check; legacy retry args are ignored."""
     async def evaluate(answer: str) -> CheckResult:
         if key in JUDGE_CHECKS:
             if judge is None:
@@ -337,14 +338,7 @@ async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, 
         return evaluate_check(key, answer, policy)
 
     result = await evaluate(first_answer)
-    if result.verdict in {CheckVerdict.PASS, CheckVerdict.REFUSED}:
-        return result, None
-    retry_answer = await get_retry()
-    retry = await evaluate(retry_answer)
-    retry.retries = 1
-    if retry.verdict == CheckVerdict.PASS:
-        retry.verdict = CheckVerdict.PASS_AFTER_RETRY
-    return retry, re_explanation
+    return result, None
 
 
 @dataclass(frozen=True)
@@ -393,8 +387,8 @@ class VerdictInput:
 
 
 def compute_verdict(data: VerdictInput) -> tuple[str, str]:
-    if data.consent_refused or data.unresolved_flags or any(data.checks.get(k, CheckResult(k, CheckVerdict.UNCLEAR, "", True)).verdict == CheckVerdict.FAIL for k in MANDATORY_CHECKS) or data.unresolved_failure or data.flags:
+    if data.consent_refused or data.unresolved_flags or data.unresolved_failure or data.flags:
         return "red", "hold"
-    if any(data.checks.get(k, CheckResult(k, CheckVerdict.UNCLEAR, "", True)).verdict in {CheckVerdict.UNCLEAR, CheckVerdict.PASS_AFTER_RETRY} for k in MANDATORY_CHECKS) or data.low_confidence:
+    if any(data.checks.get(k, CheckResult(k, CheckVerdict.UNCLEAR, "", True)).verdict in {CheckVerdict.FAIL, CheckVerdict.UNCLEAR, CheckVerdict.REFUSED, CheckVerdict.PASS_AFTER_RETRY} for k in MANDATORY_CHECKS) or data.low_confidence:
         return "amber", "pending_review"
     return "green", "clear"

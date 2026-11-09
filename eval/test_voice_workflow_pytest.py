@@ -183,7 +183,7 @@ async def test_identity_confirmation_advances_to_policy_facts_and_first_check(bo
     io = FakeIO(replies)
     workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, FakeConversationAgent(responses))
 
-    await workflow.run()
+    report = await workflow.run()
 
     assert session.identity_verified is True
     assert session.policy_explanation_completed is True
@@ -199,6 +199,11 @@ async def test_identity_confirmation_advances_to_policy_facts_and_first_check(bo
         if call["pending_check"] in mandatory_sequence
     ]
     assert spoken_checks == mandatory_sequence
+    assert report["verdict"] == "green"
+    assert session.workflow_complete is True
+    assert session.status.value == "completed"
+    assert all(session.retry_counts.get(check_id, 0) == 0 for check_id in mandatory_sequence)
+    assert len([line for line in io.spoken if line in [VOICE_PROMPTS[key] for key in mandatory_sequence]]) == 7
 
 
 @pytest.mark.parametrize("recipient_answer", ["सुनीता", "सुनीता को मिलेगा", "Sunita", "Sunita को मिलेगा"])
@@ -328,10 +333,9 @@ async def test_repeated_policy_questions_do_not_exhaust_retry(bound_policy, cust
 
 
 @pytest.mark.asyncio
-async def test_genuine_incorrect_answer_consumes_one_retry_before_correction(bound_policy, customer, session):
-    io = FakeIO(["1,00,000", "1,50,000 है"])
+async def test_current_answer_wins_over_gemini_handoff_and_moves_on(bound_policy, customer, session):
+    io = FakeIO(["1,50,000 है"])
     agent = FakeConversationAgent([
-        response(candidate="1,00,000"),
         response(
             candidate="1,50,000 है",
             action=ConversationAction.PROPOSE_HANDOFF,
@@ -342,40 +346,114 @@ async def test_genuine_incorrect_answer_consumes_one_retry_before_correction(bou
     workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
     enter_comprehension(workflow)
     await workflow._process_check("premium_amount")
-    assert [answer.attempt_number for answer in session.answers] == [1, 2]
-    assert session.retry_counts["premium_amount"] == 1
-    assert session.verification_results["premium_amount"].verdict.value == "pass_after_retry"
+    assert [answer.attempt_number for answer in session.answers] == [1]
+    assert session.retry_counts["premium_amount"] == 0
+    assert session.verification_results["premium_amount"].verdict.value == "pass"
     assert workflow.flow.current_check == "premium_term"
     assert session.human_handoff is False
     assert session.end_call_requested is False
 
 
+@pytest.mark.asyncio
+async def test_discrepancy_wins_over_gemini_handoff_and_moves_on(bound_policy, customer, session):
+    io = FakeIO(["1,00,000"])
+    agent = FakeConversationAgent([
+        response(
+            candidate="1,00,000",
+            action=ConversationAction.PROPOSE_HANDOFF,
+            tool_proposal=ToolProposal("handoff_to_human", {"reason": "Gemini proposed review early"}),
+            handoff=True,
+        )
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    enter_comprehension(workflow)
+
+    await workflow._process_check("premium_amount")
+
+    assert session.verification_results["premium_amount"].verdict.value == "fail"
+    assert workflow.flow.current_check == "premium_term"
+    assert session.human_handoff is False
+    assert session.status.value == "active"
+
+
 @pytest.mark.parametrize("wrong_answer", ["दस साल", "1,00,000"])
 @pytest.mark.asyncio
-async def test_failed_premium_amount_retries_once_and_does_not_advance(
+async def test_failed_premium_amount_is_recorded_and_advances_without_retry(
     bound_policy, customer, session, wrong_answer
 ):
     workflow = ConversationalCallWorkflow(
-        FakeIO([wrong_answer, wrong_answer]),
+        FakeIO([wrong_answer]),
         customer,
         bound_policy,
         session,
-        FakeConversationAgent([
-            response(candidate=wrong_answer, spoken="अब policy term कितने साल चलेगी?"),
-            response(candidate=wrong_answer, spoken="अब policy term कितने साल चलेगी?"),
-        ]),
+        FakeConversationAgent([response(candidate=wrong_answer, spoken="अब policy term कितने साल चलेगी?")]),
     )
     enter_comprehension(workflow)
 
     await workflow._process_check("premium_amount")
 
-    assert [answer.attempt_number for answer in session.answers] == [1, 2]
+    assert [answer.attempt_number for answer in session.answers] == [1]
     assert all(answer.verification_check_id == "premium_amount" for answer in session.answers)
-    assert workflow.flow.current_check == "premium_amount"
-    assert "premium_amount" not in session.completed_checks
+    assert workflow.flow.current_check == "premium_term"
+    assert "premium_amount" in session.completed_checks
     assert all("policy term" not in text for text in workflow.io.spoken)
-    assert session.human_handoff is True
+    assert session.human_handoff is False
     assert session.end_call_requested is False
+
+
+@pytest.mark.parametrize(
+    "premium_answer,payout_timing_answer,expected_discrepancies",
+    [
+        ("1,00,000", "5 साल बाद", 1),
+        ("1,00,000", "10 साल बाद", 2),
+    ],
+)
+@pytest.mark.asyncio
+async def test_one_pass_finishes_seven_checks_then_returns_amber_for_discrepancies(
+    bound_policy, customer, session, premium_answer, payout_timing_answer, expected_discrepancies
+):
+    replies = [
+        "हाँ", "वंश", "हाँ", "हाँ", premium_answer, "5 साल", "20 साल", "pension",
+        "सुनीता", payout_timing_answer, "policy may lapse",
+    ]
+    workflow = ConversationalCallWorkflow(
+        FakeIO(replies), customer, bound_policy, session,
+        FakeConversationAgent([response() for _ in replies]),
+    )
+
+    report = await workflow.run()
+
+    mandatory = [
+        "premium_amount", "premium_term", "policy_term", "product_type",
+        "payout_recipient", "payout_timing", "stop_paying",
+    ]
+    assert report["verdict"] == "amber"
+    assert workflow.session.workflow_complete is True
+    assert workflow.session.completed_checks.issuperset(mandatory)
+    assert len([answer for answer in workflow.session.answers if answer.verification_check_id in mandatory]) == 7
+    assert sum(answer.attempt_number > 1 for answer in workflow.session.answers) == 0
+    assert len([line for line in workflow.io.spoken if line in [VOICE_PROMPTS[key] for key in mandatory]]) == 7
+    assert len([key for key in mandatory if workflow.session.verification_results[key].verdict.value in {"fail", "unclear", "refused"}]) == expected_discrepancies
+    assert workflow.session.status.value == "human_handoff"
+    assert "human review" in workflow.io.spoken[-1]
+
+
+@pytest.mark.asyncio
+async def test_incorrect_payout_timing_advances_to_stop_paying(bound_policy, customer, session):
+    workflow = ConversationalCallWorkflow(
+        FakeIO(["10 साल बाद"]), customer, bound_policy, session,
+        FakeConversationAgent([response(candidate="10 साल बाद")]),
+    )
+    enter_comprehension(workflow)
+    for _ in range(5):
+        workflow.flow.advance("check_passed")
+
+    await workflow._process_check("payout_timing")
+
+    assert workflow.session.verification_results["payout_timing"].verdict.value == "fail"
+    assert workflow.flow.current_check == "stop_paying"
+    assert len(workflow.session.answers) == 1
+    assert workflow.session.retry_counts["payout_timing"] == 0
 
 
 @pytest.mark.asyncio

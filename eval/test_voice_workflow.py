@@ -26,9 +26,7 @@ class FakeIO:
 
 
 def valid_replies(name="Asha"):
-    # The three judge-only checks have no provider in these workflow tests,
-    # so each receives its one required retry answer after the first response.
-    return ["haan", name, "haan", "1.5 lakh", "5 saal", "20 saal", "pension plan", "pension plan retry", "Asha", "Asha retry", "5 saal", "policy jaari rahegi", "continue retry", "yes"]
+    return ["haan", name, "haan", "1.5 lakh", "5 saal", "20 saal", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
 
 
 class WorkflowTests(unittest.TestCase):
@@ -44,11 +42,11 @@ class WorkflowTests(unittest.TestCase):
         result = asyncio.run(CallWorkflow(io, {"name": "Asha"}, self.policy).run())
         self.assertEqual(result.verdict, "amber")  # unavailable free-text judge remains unclear
         questions = [line for line in io.spoken if line in {__import__('agent.workflow', fromlist=['PROMPTS']).PROMPTS[k] for k in CHECK_ORDER}]
-        self.assertEqual(questions, [__import__('agent.workflow', fromlist=['PROMPTS']).PROMPTS[k] for k in CHECK_ORDER])
-        self.assertEqual([e["type"] for e in io.events].count("transcript"), 14)
-        self.assertEqual([e["type"] for e in io.events].count("check_update"), len(CHECK_ORDER))
-        self.assertEqual(sum("ek baar phir" in line for line in io.spoken), 3)
-        self.assertEqual(sum(result.checks[key].retries for key in CHECK_ORDER), 3)
+        self.assertEqual(questions, [PROMPTS[k] for k in CHECK_ORDER[:-1]])
+        self.assertEqual([e["type"] for e in io.events].count("transcript"), 10)
+        self.assertEqual([e["type"] for e in io.events].count("check_update"), len(CHECK_ORDER) - 1)
+        self.assertEqual(sum("ek baar phir" in line for line in io.spoken), 0)
+        self.assertEqual(sum(result.checks[key].retries for key in result.checks), 0)
         for event in io.events:
             self.assertIn(event["type"], {"transcript", "check_update", "flag", "verdict"})
         self.assertEqual(io.events[-1]["type"], "verdict")
@@ -62,14 +60,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(list(io.replies), [])
         self.assertEqual(io.events[-1]["type"], "verdict")
 
-    def test_one_retry_and_flags_are_emitted(self):
-        replies = ["haan", "Asha", "haan", "wrong", "1.5 lakh", "5 saal", "20 saal", "pension FD", "retry product", "Asha", "retry recipient", "5 saal", "stop", "retry stop", "yes"]
+    def test_one_pass_discrepancy_and_flags_are_emitted(self):
+        replies = ["haan", "Asha", "haan", "wrong", "5 saal", "20 saal", "pension FD", "Asha", "5 saal", "policy jaari rahegi"]
         io = FakeIO(replies)
         result = asyncio.run(CallWorkflow(io, {"name": "Asha"}, self.policy).run())
-        self.assertEqual(result.checks["premium_amount"].retries, 1)
-        self.assertLessEqual(result.checks["premium_amount"].retries, 1)
-        self.assertEqual(len([e for e in io.events if e["type"] == "transcript"]), 15)
-        self.assertTrue(all(check.retries <= 1 for check in result.checks.values()))
+        self.assertEqual(result.checks["premium_amount"].retries, 0)
+        self.assertIn(result.checks["premium_amount"].verdict.value, {"fail", "unclear"})
+        self.assertEqual(len([e for e in io.events if e["type"] == "transcript"]), 10)
+        self.assertTrue(all(check.retries == 0 for check in result.checks.values()))
         self.assertTrue(any(e["type"] == "flag" and e["flag"] == "FD_CONFUSION" for e in io.events))
         self.assertTrue(any("dedh lakh" in line for line in io.spoken))
         self.assertNotEqual(result.verdict, "green")
@@ -130,12 +128,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len([event for event in io.events if event["type"] == "transcript"]), 2)
 
     def test_policy_question_does_not_consume_retry_in_full_check(self):
-        replies = [
-            "haan", "Asha", "haan", "Premium kitna dena hai?", "1.5 lakh",
-            "5 saal", "20 saal", "pension plan", "pension plan retry",
-            "Asha", "Asha retry", "5 saal", "policy jaari rahegi",
-            "continue retry", "yes",
-        ]
+        replies = ["haan", "Asha", "haan", "Premium kitna dena hai?", "1.5 lakh", "5 saal", "20 saal", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
         io = FakeIO(replies)
         result = asyncio.run(CallWorkflow(io, {"name": "Asha"}, self.policy).run())
         self.assertEqual(result.checks["premium_amount"].retries, 0)
@@ -143,12 +136,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(io.spoken[5], PROMPTS["premium_amount"])
 
     def test_natural_number_answer_passes_without_retry(self):
-        replies = [
-            "haan", "Asha", "haan", "mera premium dedh lakh hai",
-            "paanch saal tak dena hai", "policy bees saal chalegi",
-            "pension plan", "pension plan retry", "Asha", "Asha retry",
-            "5 saal", "policy jaari rahegi", "continue retry", "yes",
-        ]
+        replies = ["haan", "Asha", "haan", "mera premium dedh lakh hai", "paanch saal tak dena hai", "policy bees saal chalegi", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
         io = FakeIO(replies)
         result = asyncio.run(CallWorkflow(io, {"name": "Asha"}, self.policy).run())
         self.assertEqual(result.checks["premium_amount"].verdict.value, "pass")

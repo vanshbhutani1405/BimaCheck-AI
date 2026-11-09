@@ -35,10 +35,11 @@ def test_payout_recipient_matches_configured_name_in_supported_scripts(bound_pol
     assert result.verdict != CheckVerdict.PASS
 
 
-def test_unclear_and_refused_answers_do_not_complete_check(bound_policy, session):
+def test_unclear_and_refused_answers_are_terminal_discrepancies(bound_policy, session):
     unclear = _complete_check(session, bound_policy, "premium_amount", "लगभग उतना ही")
     assert unclear.verdict == CheckVerdict.UNCLEAR
-    assert "premium_amount" in session.unresolved_checks
+    assert "premium_amount" not in session.unresolved_checks
+    assert "premium_amount" in session.completed_checks
     refused_session = type(session)()
     refused_session.start()
     refused_session.set_pending_question("Again?", verification_check_id="premium_term")
@@ -46,6 +47,24 @@ def test_unclear_and_refused_answers_do_not_complete_check(bound_policy, session
     answer_id = refused_session.record_answer("premium_term", "मैं नहीं बताना चाहता")
     result = VerificationEngine().evaluate_answer(session=refused_session, policy=bound_policy, check_id="premium_term", answer_id=answer_id)
     assert result.verdict != CheckVerdict.PASS
+    assert "premium_term" in refused_session.completed_checks
+
+
+def test_terminal_discrepancies_are_completed_but_require_amber_review(bound_policy, session):
+    for check_id in MANDATORY_VERIFICATION_CHECKS:
+        answer = "वंश" if check_id == "identity" else {
+            "premium_amount": "100000", "premium_term": "पाँच साल", "policy_term": "बीस साल",
+            "product_type": "pension", "payout_recipient": "Sunita", "payout_timing": "पाँच साल",
+            "stop_paying": "policy may lapse",
+        }[check_id]
+        result = _complete_check(session, bound_policy, check_id, answer, {"name": "Vansh", "name_variants": ("वंश",)} if check_id == "identity" else None)
+        if check_id == "premium_amount":
+            assert result.verdict == CheckVerdict.FAIL
+    report = VerificationEngine().calculate_verdict(session=session)
+    assert report.verdict == "amber"
+    assert report.mandatory_completed == MANDATORY_VERIFICATION_CHECKS
+    assert report.mandatory_outstanding == ()
+    assert "mandatory_premium_amount_discrepancy" in report.reason_codes
 
 
 def test_pass_after_retry_is_preserved_but_verdict_is_amber(bound_policy, session):
