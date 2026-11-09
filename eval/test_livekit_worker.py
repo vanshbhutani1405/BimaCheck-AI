@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from unittest.mock import patch
 
@@ -162,6 +163,65 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(session.shutdown_args, {"drain": False})
         self.assertIn('"type":"transcript"', room.local_participant.messages[0][0])
         self.assertTrue(any("audio_playback_completed" in line for line in logs.output))
+
+    def test_final_transcript_is_timestamped_without_logging_transcript_text(self):
+        room = FakeRoom()
+        port = LiveKitAgentSessionPort(room, session_factory=FakeAgentSession, agent_factory=FakeAgent)
+
+        async def exercise():
+            await port.start(stt="prisma", tts="timbre")
+            port._session.handlers["user_input_transcribed"](
+                type("Event", (), {"is_final": True, "transcript": "PRIVATE CUSTOMER TEXT"})()
+            )
+            transcript = await port.listen()
+            timing = port.last_transcript_timing
+            await port.close()
+            return transcript, timing
+
+        with self.assertLogs("agent.livekit_worker", level="INFO") as logs:
+            transcript, timing = asyncio.run(exercise())
+        self.assertEqual(transcript, "PRIVATE CUSTOMER TEXT")
+        self.assertIsNotNone(timing)
+        self.assertEqual(timing[0], 1)
+        self.assertIsInstance(timing[1], float)
+        self.assertTrue(any("LATENCY turn=1 STT_FINAL_RECEIVED" in line for line in logs.output))
+        self.assertNotIn("PRIVATE CUSTOMER TEXT", "\n".join(logs.output))
+
+    def test_tts_latency_log_marks_first_audio_as_unavailable(self):
+        room = FakeRoom()
+        port = LiveKitAgentSessionPort(room, session_factory=FakeAgentSession, agent_factory=FakeAgent)
+
+        async def exercise():
+            await port.start(stt="prisma", tts="timbre")
+            final_at = time.perf_counter() - 0.03
+            gemini_started = final_at + 0.005
+            gemini_completed = gemini_started + 0.01
+            port.update_latency(
+                turn_id=9,
+                transcript_final_at=final_at,
+                gemini_started_at=gemini_started,
+                gemini_completed_at=gemini_completed,
+                python_started_at=gemini_completed,
+                python_completed_at=gemini_completed + 0.001,
+                evaluation_started_at=gemini_completed,
+                evaluation_completed_at=gemini_completed + 0.001,
+            )
+            await port.speak("PRIVATE SPOKEN TEXT")
+            await port.close()
+
+        with self.assertLogs("agent.livekit_worker", level="INFO") as logs:
+            asyncio.run(exercise())
+        latency_lines = [line for line in logs.output if "LATENCY turn=9" in line]
+        self.assertTrue(any("TTS_REQUEST_START" in line for line in latency_lines))
+        summary = next(line for line in latency_lines if "STT_TO_GEMINI_MS=" in line)
+        for field in (
+            "GEMINI_MS=", "PYTHON_MS=", "EVAL_MS=", "STT_TO_TTS_REQUEST_MS=",
+            "STT_TO_TTS_GENERATION_START_MS=",
+            "TTS_REQUEST_TO_GENERATION_MS=", "TTS_TO_PLAYBACK_END_MS=",
+            "TOTAL_TO_FIRST_AUDIO_MS=unavailable",
+        ):
+            self.assertIn(field, summary)
+        self.assertNotIn("PRIVATE SPOKEN TEXT", "\n".join(logs.output))
 
     def test_participant_disconnect_unblocks_listen_as_handled_outcome(self):
         room = FakeRoom()

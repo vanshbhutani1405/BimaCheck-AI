@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Mapping
 
 from agent.compliance import MANDATORY_VERIFICATION_CHECKS, VerificationEngine
@@ -65,6 +66,12 @@ class ConversationalCallWorkflow:
         self.verifier = VerificationEngine()
         self.flow = CallFlow()
         self._finalized = False
+        self._turn_sequence = 0
+
+    def _update_latency(self, **marks: Any) -> None:
+        update = getattr(self.io, "update_latency", None)
+        if callable(update):
+            update(**marks)
 
     @staticmethod
     def _customer_requested_end(transcript: str) -> bool:
@@ -106,10 +113,24 @@ class ConversationalCallWorkflow:
 
     async def _turn(self, *, pending_check: str | None, attempt: int = 1) -> tuple[str, ConversationResponse, ToolExecutionResult | None]:
         transcript, message_id = await self._listen()
+        self._turn_sequence += 1
+        timing = getattr(self.io, "last_transcript_timing", None)
+        if isinstance(timing, tuple) and len(timing) == 2:
+            turn_id, transcript_final_at = timing
+        else:
+            turn_id, transcript_final_at = self._turn_sequence, time.perf_counter()
+        self._update_latency(turn_id=turn_id, transcript_final_at=transcript_final_at)
         relevant = ()
         if pending_check:
             fact = self.policy.get_fact(verification_check_id=pending_check)
             relevant = (fact.fact_id,) if fact.exists and fact.fact_id else ()
+        gemini_started_at = time.perf_counter()
+        self._update_latency(gemini_started_at=gemini_started_at)
+        logger.info(
+            "LATENCY turn=%s GEMINI_REQUEST_START STT_TO_GEMINI_MS=%.1f",
+            turn_id,
+            (gemini_started_at - transcript_final_at) * 1000,
+        )
         response = await self.agent.respond(
             session=self.session,
             customer_message=transcript,
@@ -119,6 +140,15 @@ class ConversationalCallWorkflow:
             customer_context=self.customer if self.session.identity_verified else {},
             relevant_fact_ids=relevant,
         )
+        gemini_completed_at = time.perf_counter()
+        python_started_at = gemini_completed_at
+        self._update_latency(gemini_completed_at=gemini_completed_at, python_started_at=python_started_at)
+        logger.info(
+            "LATENCY turn=%s GEMINI_RESPONSE_RECEIVED GEMINI_MS=%.1f",
+            turn_id,
+            (gemini_completed_at - gemini_started_at) * 1000,
+        )
+        logger.info("LATENCY turn=%s PYTHON_WORK_START", turn_id)
         proposal = response.tool_proposal
         if proposal is not None and proposal.name == "record_answer" and pending_check is None:
             logger.warning(
@@ -189,6 +219,8 @@ class ConversationalCallWorkflow:
             proposal = ToolProposal("end_call", {"reason": response.clarification_reason or "customer requested the call to end", "confirmation": True, "message_id": message_id})
 
         execution = None
+        evaluation_started_at = None
+        evaluation_completed_at = None
         if proposal is not None:
             arguments = dict(proposal.arguments)
             if proposal.name == "record_answer" and pending_check:
@@ -199,6 +231,8 @@ class ConversationalCallWorkflow:
                 arguments.setdefault("message_id", message_id)
             elif proposal.name == "end_call":
                 arguments.setdefault("message_id", message_id)
+            if proposal.name == "record_answer":
+                evaluation_started_at = time.perf_counter()
             execution = self.executor.execute(
                 tool_name=proposal.name,
                 session=self.session,
@@ -206,6 +240,8 @@ class ConversationalCallWorkflow:
                 policy=self.policy,
                 customer=self.customer,
             )
+            if evaluation_started_at is not None:
+                evaluation_completed_at = time.perf_counter()
             if (
                 proposal.name == "record_answer"
                 and not execution.success
@@ -229,6 +265,8 @@ class ConversationalCallWorkflow:
                     policy=self.policy,
                     customer=self.customer,
                 )
+                if evaluation_started_at is not None:
+                    evaluation_completed_at = time.perf_counter()
         spoken_response = response.spoken_response
         identity_result = self.session.verification_results.get("identity")
         identity_matched = identity_result is not None and identity_result.verdict in {
@@ -255,6 +293,19 @@ class ConversationalCallWorkflow:
         python_transition_turn = pending_question is not None and pending_question.verification_check_id in {
             "consent", "identity", "identity_confirmation", "facts_confirmation",
         }
+        python_completed_at = time.perf_counter()
+        self._update_latency(
+            python_completed_at=python_completed_at,
+            evaluation_started_at=evaluation_started_at,
+            evaluation_completed_at=evaluation_completed_at,
+        )
+        logger.info(
+            "LATENCY turn=%s PYTHON_WORK_END PYTHON_MS=%.1f EVAL_MS=%s",
+            turn_id,
+            (python_completed_at - python_started_at) * 1000,
+            "unavailable" if evaluation_started_at is None or evaluation_completed_at is None
+            else f"{(evaluation_completed_at - evaluation_started_at) * 1000:.1f}",
+        )
         if not python_transition_turn:
             await self._speak(spoken_response)
         for fact_id in response.policy_fact_ids:
