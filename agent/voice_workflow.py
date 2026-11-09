@@ -96,7 +96,9 @@ class ConversationalCallWorkflow:
             session=self.session,
             customer_message=transcript,
             policy=self.policy,
-            customer_context=self.customer,
+            # Keep the expected identity out of Gemini's input until Python
+            # has completed the explicit confirmation step.
+            customer_context=self.customer if self.session.identity_verified else {},
             relevant_fact_ids=relevant,
         )
         proposal = response.tool_proposal
@@ -112,7 +114,38 @@ class ConversationalCallWorkflow:
                 extra={"session_id": self.session.session_id},
             )
             proposal = None
-        if proposal is None and pending_check and response.intent in {ConversationIntent.ANSWER, ConversationIntent.CORRECTION, ConversationIntent.REFUSAL}:
+        preserve_control_action = (
+            response.handoff_requested
+            or (proposal is not None and proposal.name in {"handoff_to_human", "end_call"})
+            or (response.end_call_requested and self._customer_requested_end(transcript))
+        )
+        python_evaluates_turn = (
+            pending_check == "identity"
+            or (
+                pending_check is not None
+                and pending_check == self.flow.current_check
+                and response.intent in {
+                    ConversationIntent.ANSWER,
+                    ConversationIntent.CORRECTION,
+                    ConversationIntent.REFUSAL,
+                }
+            )
+        )
+        if python_evaluates_turn and not preserve_control_action:
+            # The pending Python check owns evaluation. Gemini's intent cannot
+            # redirect an identity turn, and an unrelated tool proposal cannot
+            # redirect an answer to the current mandatory check.
+            proposal = ToolProposal(
+                "record_answer",
+                {
+                    "check_id": pending_check,
+                    "answer_candidate": response.answer_candidate or transcript,
+                    "original_transcript": transcript,
+                    "message_id": message_id,
+                    "attempt_number": attempt,
+                },
+            )
+        elif proposal is None and pending_check and response.intent in {ConversationIntent.ANSWER, ConversationIntent.CORRECTION, ConversationIntent.REFUSAL}:
             proposal = ToolProposal(
                 "record_answer",
                 {
@@ -169,7 +202,34 @@ class ConversationalCallWorkflow:
                     policy=self.policy,
                     customer=self.customer,
                 )
-        await self._speak(response.spoken_response)
+        spoken_response = response.spoken_response
+        identity_result = self.session.verification_results.get("identity")
+        identity_matched = identity_result is not None and identity_result.verdict in {
+            CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY,
+        }
+        if not identity_matched:
+            expected_names = (
+                str(self.customer.get("name", "")),
+                *(str(value) for value in self.customer.get("name_variants", ())),
+            )
+            spoken_folded = spoken_response.casefold()
+            if any(name and name.casefold() in spoken_folded for name in expected_names):
+                spoken_response = "जी, धन्यवाद।"
+        if (
+            pending_check is not None
+            and pending_check == self.flow.current_check
+            and execution is not None
+            and execution.tool_name == "record_answer"
+        ):
+            # Python will decide whether to retry or ask the next check. Do not
+            # let Gemini's answer-turn wording announce a different question.
+            spoken_response = "जी, धन्यवाद।"
+        pending_question = self.session.get_pending_question()
+        python_transition_turn = pending_question is not None and pending_question.verification_check_id in {
+            "consent", "identity", "identity_confirmation", "facts_confirmation",
+        }
+        if not python_transition_turn:
+            await self._speak(spoken_response)
         for fact_id in response.policy_fact_ids:
             fact = self.policy.get_fact(fact_id=fact_id)
             if fact.exists:
@@ -177,6 +237,8 @@ class ConversationalCallWorkflow:
         return transcript, response, execution
 
     async def _process_check(self, check_id: str, *, advance: bool = True) -> None:
+        if check_id != "identity" and self.flow.current_check != check_id:
+            raise ValueError(f"{check_id!r} is not the current mandatory check")
         prompt = VOICE_PROMPTS[check_id]
         question = self.session.set_pending_question(prompt, verification_check_id=check_id)
         await self._speak(prompt)
@@ -222,8 +284,13 @@ class ConversationalCallWorkflow:
                         customer=self.customer,
                     )
                     return
-                self.flow.advance("check_passed")
-                self.session.set_stage(self.flow.stage.value)
+                self.executor.execute(
+                    tool_name="handoff_to_human",
+                    session=self.session,
+                    arguments={"reason": f"mandatory verification failed after retry: {check_id}"},
+                    policy=self.policy,
+                    customer=self.customer,
+                )
                 return
 
             if self.session.status != SessionStatus.ACTIVE:
@@ -362,12 +429,16 @@ class ConversationalCallWorkflow:
         self.session.set_stage(self.flow.stage.value)
 
         for check_id in CHECK_ORDER:
-            # Affordability remains an advisory Python evaluation, not one of
-            # the seven mandatory customer comprehension questions.
-            if check_id == "affordability":
+            if check_id not in MANDATORY_VERIFICATION_CHECKS:
                 continue
+            if self.flow.current_check != check_id:
+                raise RuntimeError("workflow check order diverged from Python call state")
             await self._process_check(check_id)
             if self.session.status != SessionStatus.ACTIVE:
+                break
+            if self.flow.current_check == check_id:
+                # A check that did not pass after its single retry is terminal;
+                # never enter a later mandatory check.
                 break
         report = await self._finalize()
         await self._speak(VOICE_PROMPTS["wrap_green"] if report["verdict"] == "green" else VOICE_PROMPTS["human"])

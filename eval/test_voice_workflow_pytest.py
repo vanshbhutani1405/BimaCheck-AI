@@ -7,12 +7,12 @@ import pytest
 
 from agent.conversation_agent import ConversationAction, ConversationIntent, ConversationResponse, ToolProposal
 from agent.livekit_worker import LiveKitAgentSessionPort, run_conversational_session
-from agent.voice_workflow import ConversationalCallWorkflow
+from agent.voice_workflow import VOICE_PROMPTS, ConversationalCallWorkflow
 
 
-def response(intent=ConversationIntent.ANSWER, candidate=None, action=ConversationAction.PROPOSE_RECORD_ANSWER, tool_proposal=None):
+def response(intent=ConversationIntent.ANSWER, candidate=None, action=ConversationAction.PROPOSE_RECORD_ANSWER, tool_proposal=None, spoken="जी, धन्यवाद।"):
     return ConversationResponse(
-        spoken_response="जी, धन्यवाद।",
+        spoken_response=spoken,
         intent=intent,
         conversation_action=action,
         tool_proposal=tool_proposal,
@@ -68,7 +68,27 @@ async def test_one_check_records_evidence_and_advances_python_workflow(bound_pol
     assert session.verification_results["premium_amount"].verdict.value == "pass"
     assert session.answers[0].original_answer == "डेढ़ लाख"
     assert session.pending_question is None
+    assert workflow.flow.current_check == "premium_term"
     assert io.events[0]["final"] is True
+
+
+@pytest.mark.asyncio
+async def test_unrelated_gemini_tool_proposal_cannot_redirect_current_check(bound_policy, customer, session):
+    io = FakeIO(["डेढ़ लाख"])
+    agent = FakeConversationAgent([
+        response(
+            candidate="डेढ़ लाख",
+            tool_proposal=ToolProposal("get_policy_fact", {"verification_check_id": "policy_term"}),
+        )
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    enter_comprehension(workflow)
+
+    await workflow._process_check("premium_amount")
+
+    assert session.verification_results["premium_amount"].verdict.value == "pass"
+    assert "policy_term" not in session.verification_results
+    assert workflow.flow.current_check == "premium_term"
 
 
 @pytest.mark.asyncio
@@ -103,6 +123,99 @@ async def test_malformed_identity_proposal_is_replaced_by_python_arguments(bound
     assert len(session.answers) == 1
     assert session.answers[0].original_answer == "वंश"
     assert session.verification_results["identity"].verdict.value == "pass"
+
+
+@pytest.mark.parametrize("name_transcript", ["वंश", "वंशपूटानी"])
+@pytest.mark.asyncio
+async def test_identity_name_is_evaluated_even_when_gemini_classifies_it_as_confusion(
+    bound_policy, customer, session, name_transcript
+):
+    io = FakeIO([name_transcript, "हाँ"])
+    agent = FakeConversationAgent([
+        response(
+            ConversationIntent.CONFUSION,
+            candidate=None,
+            action=ConversationAction.REQUEST_CLARIFICATION,
+            tool_proposal=ToolProposal("get_policy_fact", {"verification_check_id": "policy_term"}),
+            spoken="अब आपकी policy का term क्या है?",
+        ),
+        response(candidate=None, action=ConversationAction.RESPOND),
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    workflow.flow.advance("connected")
+    workflow.flow.advance("consent", accepted=True)
+
+    await workflow._process_check("identity", advance=False)
+
+    assert session.verification_results["identity"].verdict.value == "pass"
+    assert session.answers[0].original_answer == name_transcript
+    assert session.identity_verified is False
+    assert await workflow._confirm_identity() is True
+    assert session.identity_verified is False
+    assert io.spoken[-1] == VOICE_PROMPTS["identity_confirm"].format(name="वंश")
+    assert VOICE_PROMPTS["policy_term"] not in io.spoken
+
+
+@pytest.mark.asyncio
+async def test_fresh_identity_turn_hides_expected_name_from_gemini_and_speech(bound_policy, customer, session):
+    session.set_pending_question(VOICE_PROMPTS["identity"], verification_check_id="identity")
+    io = FakeIO(["जी"])
+    agent = FakeConversationAgent([
+        response(ConversationIntent.CONFUSION, action=ConversationAction.REQUEST_CLARIFICATION, spoken="धन्यवाद वंश जी।")
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+
+    await workflow._turn(pending_check="identity")
+
+    assert agent.calls[0]["customer_context"] == {}
+    assert all("वंश" not in text and "Vansh" not in text for text in io.spoken)
+    assert VOICE_PROMPTS["identity"] == "सबसे पहले, क्या मैं आपका नाम जान सकता हूँ?"
+
+
+@pytest.mark.asyncio
+async def test_identity_confirmation_advances_to_policy_facts_and_first_check(bound_policy, customer, session):
+    replies = [
+        "हाँ", "वंश", "हाँ", "हाँ", "डेढ़ लाख", "पाँच साल", "बीस साल",
+        "pension", "Sunita", "पाँच साल बाद", "policy lapse ho sakti hai",
+    ]
+    responses = [response() for _ in replies]
+    responses[1] = response(ConversationIntent.UNKNOWN, action=ConversationAction.REQUEST_CLARIFICATION)
+    io = FakeIO(replies)
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, FakeConversationAgent(responses))
+
+    await workflow.run()
+
+    assert session.identity_verified is True
+    assert session.policy_explanation_completed is True
+    assert "premium_amount" in session.verification_results
+    assert any("policy Suraksha Pension Plus" in spoken for spoken in io.spoken)
+    assert "आपका annual premium कितना है?" in io.spoken
+    mandatory_sequence = [
+        "premium_amount", "premium_term", "policy_term", "product_type",
+        "payout_recipient", "payout_timing", "stop_paying",
+    ]
+    spoken_checks = [
+        call["pending_check"] for call in workflow.agent.calls
+        if call["pending_check"] in mandatory_sequence
+    ]
+    assert spoken_checks == mandatory_sequence
+
+
+@pytest.mark.asyncio
+async def test_unmatched_identity_does_not_verify_customer(bound_policy, customer, session):
+    io = FakeIO(["किसी और का नाम", "दूसरा नाम"])
+    agent = FakeConversationAgent([
+        response(spoken="धन्यवाद वंश जी।"), response(spoken="वंश जी, कृपया बताइए।")
+    ])
+    workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
+    workflow.flow.advance("connected")
+    workflow.flow.advance("consent", accepted=True)
+
+    await workflow._process_check("identity", advance=False)
+
+    assert session.identity_verified is False
+    assert session.verification_results["identity"].verdict.value == "fail"
+    assert all("वंश" not in text and "Vansh" not in text for text in io.spoken)
 
 
 @pytest.mark.asyncio
@@ -207,6 +320,44 @@ async def test_genuine_incorrect_answer_consumes_one_retry_before_correction(bou
     assert [answer.attempt_number for answer in session.answers] == [1, 2]
     assert session.retry_counts["premium_amount"] == 1
     assert session.verification_results["premium_amount"].verdict.value == "pass_after_retry"
+    assert workflow.flow.current_check == "premium_term"
+
+
+@pytest.mark.parametrize("wrong_answer", ["दस साल", "1,00,000"])
+@pytest.mark.asyncio
+async def test_failed_premium_amount_retries_once_and_does_not_advance(
+    bound_policy, customer, session, wrong_answer
+):
+    workflow = ConversationalCallWorkflow(
+        FakeIO([wrong_answer, wrong_answer]),
+        customer,
+        bound_policy,
+        session,
+        FakeConversationAgent([
+            response(candidate=wrong_answer, spoken="अब policy term कितने साल चलेगी?"),
+            response(candidate=wrong_answer, spoken="अब policy term कितने साल चलेगी?"),
+        ]),
+    )
+    enter_comprehension(workflow)
+
+    await workflow._process_check("premium_amount")
+
+    assert [answer.attempt_number for answer in session.answers] == [1, 2]
+    assert all(answer.verification_check_id == "premium_amount" for answer in session.answers)
+    assert workflow.flow.current_check == "premium_amount"
+    assert "premium_amount" not in session.completed_checks
+    assert all("policy term" not in text for text in workflow.io.spoken)
+
+
+@pytest.mark.asyncio
+async def test_policy_term_cannot_run_before_current_premium_check(bound_policy, customer, session):
+    workflow = ConversationalCallWorkflow(
+        FakeIO([]), customer, bound_policy, session, FakeConversationAgent([])
+    )
+    enter_comprehension(workflow)
+
+    with pytest.raises(ValueError, match="not the current mandatory check"):
+        await workflow._process_check("policy_term")
 
 
 class FakeAgentSession:
