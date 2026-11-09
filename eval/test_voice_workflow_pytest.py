@@ -30,6 +30,7 @@ class FakeIO:
         self.replies = iter(replies)
         self.spoken = []
         self.events = []
+        self.latency_marks = {}
 
     async def listen(self):
         return next(self.replies)
@@ -39,6 +40,9 @@ class FakeIO:
 
     async def publish(self, event):
         self.events.append(dict(event))
+
+    def update_latency(self, **marks):
+        self.latency_marks.update(marks)
 
 
 class FakeConversationAgent:
@@ -60,7 +64,8 @@ def enter_comprehension(workflow):
 
 
 @pytest.mark.asyncio
-async def test_one_check_records_evidence_and_advances_python_workflow(bound_policy, customer, session):
+async def test_one_check_records_evidence_and_advances_python_workflow(bound_policy, customer, session, caplog):
+    caplog.set_level("INFO", logger="agent.voice_workflow")
     io = FakeIO(["डेढ़ लाख"])
     workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, FakeConversationAgent([response(candidate="डेढ़ लाख")]))
     enter_comprehension(workflow)
@@ -70,6 +75,14 @@ async def test_one_check_records_evidence_and_advances_python_workflow(bound_pol
     assert session.pending_question is None
     assert workflow.flow.current_check == "premium_term"
     assert io.events[0]["final"] is True
+    assert io.latency_marks["gemini_started_at"] <= io.latency_marks["gemini_completed_at"]
+    assert io.latency_marks["python_started_at"] <= io.latency_marks["python_completed_at"]
+    assert io.latency_marks["evaluation_started_at"] <= io.latency_marks["evaluation_completed_at"]
+    latency_logs = "\n".join(record.getMessage() for record in caplog.records if "LATENCY turn=" in record.getMessage())
+    assert "GEMINI_REQUEST_START" in latency_logs
+    assert "GEMINI_RESPONSE_RECEIVED" in latency_logs
+    assert "PYTHON_WORK_END" in latency_logs
+    assert "डेढ़ लाख" not in latency_logs
 
 
 @pytest.mark.asyncio
