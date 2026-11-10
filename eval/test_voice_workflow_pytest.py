@@ -201,7 +201,7 @@ async def test_fresh_identity_turn_hides_expected_name_from_gemini_and_speech(bo
 @pytest.mark.asyncio
 async def test_identity_match_advances_without_confirmation_and_grouped_checks_complete(bound_policy, customer, session):
     replies = [
-        "हाँ", "वंश", "हाँ", "डेढ़ लाख और पाँच साल", "बीस साल और pension",
+        "हाँ", "वंश", "हाँ", "मेरा annual premium ₹1,50,000 है और premium हर साल भरना है, 10 साल तक।", "बीस साल और pension",
         "सुनीता और पाँच साल बाद", "policy lapse ho sakti hai",
     ]
     responses = [response() for _ in replies]
@@ -245,7 +245,7 @@ async def test_identity_match_advances_without_confirmation_and_grouped_checks_c
 @pytest.mark.parametrize(
     "check_ids,prompt_key,first_fragment,second_fragment,expected",
     [
-        (("premium_amount", "premium_term"), "group_premium", "मेरा annual premium 1,50,000 है", "5 साल तक भरना होगा", ("pass", "pass")),
+        (("premium_amount", "premium_term"), "group_premium", "मेरा annual premium 1,50,000 है", "10 साल तक भरना होगा", ("pass", "pass")),
         (("policy_term", "product_type"), "group_term", "मेरी policy", "20 साल तक चलेगी, यह pension product है", ("pass", "pass")),
         (("payout_recipient", "payout_timing"), "group_payout", "Sunita को payout मिलेगा", "5 साल बाद pension शुरू होगी", ("pass", "pass")),
     ],
@@ -283,7 +283,7 @@ async def test_grouped_answer_fragments_are_combined_before_evaluation(
 async def test_split_wrong_premium_and_correct_payment_term_are_evaluated_independently(
     bound_policy, customer, session
 ):
-    first, second = "मेरा annual premium 1,00,000 है", "5 साल तक भरना होगा"
+    first, second = "मेरा annual premium 1,00,000 है", "10 साल तक भरना होगा"
     io = FakeIO([first, second])
     agent = FakeConversationAgent([response(candidate=f"{first} {second}")])
     workflow = ConversationalCallWorkflow(io, customer, bound_policy, session, agent)
@@ -569,7 +569,7 @@ async def test_one_pass_finishes_seven_checks_then_returns_amber_for_discrepanci
     bound_policy, customer, session, premium_answer, payout_timing_answer, expected_discrepancies
 ):
     replies = [
-        "हाँ", "वंश", "हाँ", f"{premium_answer} और 5 साल", "20 साल और pension",
+        "हाँ", "वंश", "हाँ", f"{premium_answer} और 10 साल", "20 साल और pension",
         f"सुनीता और {payout_timing_answer}", "policy may lapse",
     ]
     workflow = ConversationalCallWorkflow(

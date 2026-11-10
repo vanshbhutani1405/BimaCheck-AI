@@ -18,7 +18,7 @@ def _complete_check(session, policy, check_id, answer, customer=None, attempt=1)
 def test_identity_and_numeric_answers_are_authoritatively_evaluated(bound_policy, customer, session):
     assert _complete_check(session, bound_policy, "identity", "वंश", customer).verdict == CheckVerdict.PASS
     assert _complete_check(session, bound_policy, "premium_amount", "डेढ़ लाख").verdict == CheckVerdict.PASS
-    assert _complete_check(session, bound_policy, "premium_term", "पाँच साल").verdict == CheckVerdict.PASS
+    assert _complete_check(session, bound_policy, "premium_term", "दस साल").verdict == CheckVerdict.PASS
     assert _complete_check(session, bound_policy, "policy_term", "बीस साल").verdict == CheckVerdict.PASS
 
 
@@ -53,7 +53,7 @@ def test_unclear_and_refused_answers_are_terminal_discrepancies(bound_policy, se
 def test_terminal_discrepancies_are_completed_but_require_amber_review(bound_policy, session):
     for check_id in MANDATORY_VERIFICATION_CHECKS:
         answer = "वंश" if check_id == "identity" else {
-            "premium_amount": "100000", "premium_term": "पाँच साल", "policy_term": "बीस साल",
+            "premium_amount": "100000", "premium_term": "दस साल", "policy_term": "बीस साल",
             "product_type": "pension", "payout_recipient": "Sunita", "payout_timing": "पाँच साल",
             "stop_paying": "policy may lapse",
         }[check_id]
@@ -70,7 +70,7 @@ def test_terminal_discrepancies_are_completed_but_require_amber_review(bound_pol
 def test_pass_after_retry_is_preserved_but_verdict_is_amber(bound_policy, session):
     for check_id in MANDATORY_VERIFICATION_CHECKS:
         answer = "वंश" if check_id == "identity" else {
-            "premium_amount": "डेढ़ लाख", "premium_term": "पाँच साल", "policy_term": "बीस साल",
+            "premium_amount": "डेढ़ लाख", "premium_term": "दस साल", "policy_term": "बीस साल",
             "product_type": "pension", "payout_recipient": "Sunita", "payout_timing": "पाँच साल",
             "stop_paying": "policy may lapse", "affordability": "yes",
         }.get(check_id, "yes")

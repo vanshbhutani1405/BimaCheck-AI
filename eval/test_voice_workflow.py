@@ -26,13 +26,13 @@ class FakeIO:
 
 
 def valid_replies(name="Asha"):
-    return ["haan", name, "haan", "1.5 lakh", "5 saal", "20 saal", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
+    return ["haan", name, "haan", "1.5 lakh", "10 saal", "20 saal", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
 
 
 class WorkflowTests(unittest.TestCase):
     policy = {
         "product_name": "Suraksha Pension Plus", "premium_amount": 150000,
-        "premium_term_years": 5, "policy_term_years": 20,
+        "premium_term_years": 10, "policy_term_years": 20,
         "payout_start_after_years": 5, "product_type": "deferred annuity",
         "payout_recipient": "Asha", "declared_income": 600000,
     }
@@ -92,7 +92,7 @@ class WorkflowTests(unittest.TestCase):
         asyncio.run(CallWorkflow(io, {"name": "Asha"}, self.policy).run())
         self.assertEqual(
             io.spoken[2],
-            "Aapki policy Suraksha Pension Plus hai. Har saal ka premium dedh lakh rupaye hai, jo paanch saal tak bharna hai. Policy bees saal tak chalegi. Kya yeh jaankari sahi hai?",
+            "Aapki policy Suraksha Pension Plus hai. Har saal ka premium dedh lakh rupaye hai, jo das saal tak bharna hai. Policy bees saal tak chalegi. Kya yeh jaankari sahi hai?",
         )
         self.assertNotIn("150000", io.spoken[2])
         self.assertNotIn("20 saal", io.spoken[2])
@@ -101,7 +101,7 @@ class WorkflowTests(unittest.TestCase):
         questions = {
             "Yeh FD hai kya?": "Nahi, yeh fixed deposit nahi hai. Yeh deferred annuity hai.",
             "Premium kitna dena hai?": "Record ke mutabik har saal ka premium dedh lakh rupaye hai.",
-            "Premium kitne saal bharna hai?": "Premium har saal paanch saal tak bharna hai.",
+            "Premium kitne saal bharna hai?": "Premium har saal das saal tak bharna hai.",
             "Policy kitne saal chalegi?": "Policy bees saal tak chalegi.",
             "Pension kab shuru hogi?": "Pension paanch saal baad shuru hogi.",
             "Paisa kisko milega?": "Policy record ke mutabik payout Asha ko milega.",
@@ -136,7 +136,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(io.spoken[5], PROMPTS["premium_amount"])
 
     def test_natural_number_answer_passes_without_retry(self):
-        replies = ["haan", "Asha", "haan", "mera premium dedh lakh hai", "paanch saal tak dena hai", "policy bees saal chalegi", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
+        replies = ["haan", "Asha", "haan", "mera premium dedh lakh hai", "das saal tak dena hai", "policy bees saal chalegi", "pension plan", "Asha", "5 saal", "policy jaari rahegi"]
         io = FakeIO(replies)
         result = asyncio.run(CallWorkflow(io, {"name": "Asha"}, self.policy).run())
         self.assertEqual(result.checks["premium_amount"].verdict.value, "pass")
