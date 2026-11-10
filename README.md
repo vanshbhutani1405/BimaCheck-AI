@@ -253,9 +253,4 @@ pytest
 <br>
 
 <div align="center">
-
-**Scope:** this repo contains the voice agent only. No database, backend, or frontend.
-
-<sub>Built by Vansh</sub>
-
 </div>
