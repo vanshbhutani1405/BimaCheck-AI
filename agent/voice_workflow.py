@@ -22,15 +22,15 @@ ANSWER_FRAGMENT_TIMEOUT_SECONDS = 0.4
 VOICE_PROMPTS = {
     "disclosure": "नमस्ते! मैं BimaCheck से बात कर रहा हूँ। आपकी insurance policy की कुछ जानकारी verify करनी है। क्या हम शुरू कर सकते हैं?",
     "identity": "सबसे पहले, कृपया अपना नाम बताइए।",
-    "facts": "आपकी policy {product_name} एक {product_type} pension product है, यानी यह fixed deposit नहीं है। इसमें annual premium ₹{premium_amount} है। आपको यह premium हर साल, कुल {premium_term_years} साल तक भरना है। आपकी policy की कुल अवधि {policy_term_years} साल है। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी। {stop_paying_explanation}। अब मैं आपसे कुछ छोटे सवाल पूछूँगा, ताकि आपकी policy details verify कर सकूँ।",
+    "facts": "आपकी policy {product_name} एक {product_type} pension product है, यानी यह fixed deposit नहीं है। इसमें annual premium ₹{premium_amount} है, जो आपको हर साल {premium_term_years} बार भरना है। आपकी policy की कुल अवधि {policy_term_years} साल है। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी। {stop_paying_explanation}। अब मैं आपसे कुछ छोटे सवाल पूछूँगा।",
     "premium_amount": "आपका annual premium कितना है?",
-    "premium_term": "आपको हर साल premium कितने साल तक भरना होगा?",
+    "premium_term": "आपको हर साल premium कितनी बार भरना होगा?",
     "policy_term": "आपकी policy कितने साल तक चलेगी?",
     "product_type": "यह product fixed deposit है या pension product?",
     "payout_recipient": "Policy record के मुताबिक payout किसे मिलेगा?",
     "payout_timing": "Pension कब शुरू होगी?",
     "stop_paying": "अगर आप premium देना बंद कर दें, तो policy पर क्या असर पड़ सकता है?",
-    "group_premium": "आपका annual premium कितना है और इसे हर साल कितने साल तक भरना है?",
+    "group_premium": "आपका annual premium कितना है और इसे हर साल कितनी बार भरना है?",
     "group_term": "आपकी policy कितने साल की है और यह किस तरह का product है?",
     "group_payout": "Policy का payout किसे मिलेगा और pension payment कब शुरू होगी?",
     "affordability": "क्या यह premium आपकी आमदनी के हिसाब से manageable है?",
@@ -58,16 +58,16 @@ def _record_value_for(check_id: str, policy: Mapping[str, Any]) -> str:
     if check_id == "premium_amount":
         return f"annual premium ₹{_format_indian_amount(policy['premium_amount'])} है"
     if check_id == "premium_term":
-        return f"premium हर साल {format_policy_value(policy['premium_term_years'], kind='duration')} तक भरना है"
+        return f"premium हर साल {policy['premium_term_years']} बार भरना है"
     if check_id == "policy_term":
-        return f"policy {format_policy_value(policy['policy_term_years'], kind='duration')} तक चलेगी"
+        return f"policy की कुल अवधि {policy['policy_term_years']} साल है"
     if check_id == "product_type":
         return f"यह {policy['product_type']} है"
     if check_id == "payout_recipient":
         return f"payout {policy['payout_recipient']} को मिलेगा"
     if check_id == "payout_timing":
-        return f"pension {format_policy_value(policy['payout_start_after_years'], kind='duration')} बाद शुरू होगी"
-    return str(policy["stop_paying_explanation"])
+        return "pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी"
+    return "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं"
 
 
 class ConversationalCallWorkflow:
