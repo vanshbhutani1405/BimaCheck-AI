@@ -80,7 +80,7 @@
       "available": true,
       "value": "after 5 years",
       "years_after_start": 5,
-      "explanation": "Pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी।"
+      "explanation": "Pension payment 5 साल बाद शुरू होगी।"
     },
     "benefit_conditions": {
       "available": false,
@@ -128,7 +128,7 @@
     "premium_term": "Premium हर साल भरना है, 10 साल तक।",
     "policy_term": "Policy की कुल अवधि 20 साल है।",
     "payout_recipient": "Policy record के मुताबिक payout Sunita को मिलेगा।",
-    "payout_timing": "Pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी।",
+    "payout_timing": "Pension payment 5 साल बाद शुरू होगी।",
     "stop_paying": "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
   },
   "verification_mapping": {

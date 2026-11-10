@@ -215,6 +215,10 @@ async def test_identity_match_advances_without_confirmation_and_grouped_checks_c
     assert session.policy_explanation_completed is True
     assert "premium_amount" in session.verification_results
     assert any("policy Suraksha Pension Plus" in spoken for spoken in io.spoken)
+    facts = next(spoken for spoken in io.spoken if "annual premium ₹1,50,000" in spoken)
+    assert "Premium हर साल भरना है, 10 साल तक" in facts
+    assert "pension payment 5 साल बाद शुरू होगी" in facts
+    assert "premium भरने की अवधि पूरी होने के बाद" not in facts
     assert VOICE_PROMPTS["group_premium"] in io.spoken
     mandatory_sequence = [
         "premium_amount", "premium_term", "policy_term", "product_type",
@@ -614,6 +618,7 @@ async def test_incorrect_payout_timing_advances_to_stop_paying(bound_policy, cus
     assert workflow.flow.current_check == "stop_paying"
     assert len(workflow.session.answers) == 1
     assert workflow.session.retry_counts["payout_timing"] == 0
+    assert any("pension payment 5 साल बाद शुरू होगी" in line for line in workflow.io.spoken)
 
 
 @pytest.mark.asyncio
