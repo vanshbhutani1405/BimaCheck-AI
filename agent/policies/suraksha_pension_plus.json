@@ -36,13 +36,13 @@
     },
     "payment_term_years": {
       "available": true,
-      "value": 5,
-      "explanation": "Premium हर साल 5 बार भरना है।"
+      "value": 10,
+      "explanation": "Premium हर साल भरना है, 10 साल तक।"
     },
     "payment_details": {
       "available": true,
       "value": "annual premium payments for the stated payment term",
-      "explanation": "Premium हर साल 5 बार भरना है।"
+      "explanation": "Premium हर साल भरना है, 10 साल तक।"
     }
   },
   "policy_duration": {
@@ -125,7 +125,7 @@
     "unsupported_fact": "इस policy record में इस बात की जानकारी उपलब्ध नहीं है। मैं इसकी पुष्टि नहीं कर सकता।",
     "fixed_deposit_confusion": "यह fixed deposit नहीं है; यह deferred annuity pension product है।",
     "premium_amount": "Record के अनुसार annual premium ₹1,50,000 है।",
-    "premium_term": "Premium हर साल 5 बार भरना है।",
+    "premium_term": "Premium हर साल भरना है, 10 साल तक।",
     "policy_term": "Policy की कुल अवधि 20 साल है।",
     "payout_recipient": "Policy record के मुताबिक payout Sunita को मिलेगा।",
     "payout_timing": "Pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी।",

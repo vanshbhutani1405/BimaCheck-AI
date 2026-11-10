@@ -55,7 +55,7 @@ class NumberParserTests(unittest.TestCase):
             ("policy_term", "policy tees saal chalegi", 30),
             ("payout_timing", "pension paanch saal baad shuru hogi", 5),
             ("premium_amount", "मेरा प्रीमियम डेढ़ लाख है", 150000),
-            ("premium_term", "प्रीमियम पाँच साल तक भरना है", 5),
+            ("premium_term", "प्रीमियम दस साल तक भरना है", 10),
         ]
         for key, utterance, expected in cases:
             with self.subTest(key=key, utterance=utterance):
@@ -64,7 +64,7 @@ class NumberParserTests(unittest.TestCase):
     def test_natural_sentence_ambiguity_is_unclear(self):
         cases = [
             ("premium_amount", "premium dedh lakh ya dhai lakh hai"),
-            ("premium_term", "premium paanch saal ya das saal bharna hai"),
+            ("premium_term", "premium das saal ya bees saal bharna hai"),
             ("policy_term", "policy bees saal ya tees saal chalegi"),
             ("payout_timing", "pension paanch saal ya das saal baad shuru hogi"),
             ("premium_amount", "premium itna hai aur 5 saal dena hai"),
@@ -76,13 +76,13 @@ class NumberParserTests(unittest.TestCase):
     def test_natural_number_evaluation_uses_policy_check(self):
         policy = {
             "premium_amount": 150000,
-            "premium_term_years": 5,
+            "premium_term_years": 10,
             "policy_term_years": 30,
             "payout_start_after_years": 5,
         }
         answers = {
             "premium_amount": "mera premium dedh lakh hai",
-            "premium_term": "har saal paanch saal dene hain",
+            "premium_term": "har saal das saal dene hain",
             "policy_term": "policy tees saal chalegi",
             "payout_timing": "pension paanch saal baad shuru hogi",
         }
@@ -191,10 +191,10 @@ class JudgeAndVerdictTests(unittest.TestCase):
         async def request_retry():
             calls.append("retry")
             return "unknown"
-        policy = {"premium_term_years": 5}
+        policy = {"premium_term_years": 10}
         result, prompt = asyncio.run(evaluate_with_retry(
             "premium_term", "one year", policy,
-            re_explanation="The record says five years.", get_retry=request_retry,
+            re_explanation="The record says ten years.", get_retry=request_retry,
         ))
         self.assertEqual(calls, [])
         self.assertEqual(result.retries, 0)
