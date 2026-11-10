@@ -15,6 +15,7 @@ def test_suraksha_policy_contains_approved_values(policy):
     assert policy["product_type"] == "deferred annuity"
     assert policy["payout_recipient"] == "Sunita"
     assert policy["payout_start_after_years"] == 5
+    assert policy.approved_explanation("payout_timing") == "Pension payment 5 साल बाद शुरू होगी।"
 
 
 def test_policy_fact_retrieval_by_id_section_and_check(policy):

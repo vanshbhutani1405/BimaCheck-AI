@@ -22,7 +22,7 @@ ANSWER_FRAGMENT_TIMEOUT_SECONDS = 0.4
 VOICE_PROMPTS = {
     "disclosure": "नमस्ते! मैं BimaCheck से बात कर रहा हूँ। आपकी insurance policy की कुछ जानकारी verify करनी है। क्या हम शुरू कर सकते हैं?",
     "identity": "सबसे पहले, कृपया अपना नाम बताइए।",
-    "facts": "आपकी policy {product_name} एक {product_type} pension product है, यानी यह fixed deposit नहीं है। इस policy में आपका annual premium ₹{premium_amount} है। Premium हर साल भरना है, {premium_term_years} साल तक। आपकी policy की कुल अवधि {policy_term_years} साल है। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी। {stop_paying_explanation}। अब मैं आपसे कुछ छोटे सवाल पूछूँगा।",
+    "facts": "आपकी policy {product_name} एक {product_type} pension product है, यानी यह fixed deposit नहीं है। इस policy में आपका annual premium ₹{premium_amount} है। Premium हर साल भरना है, {premium_term_years} साल तक। आपकी policy की कुल अवधि {policy_term_years} साल है। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension payment {payout_start_after_years} साल बाद शुरू होगी। {stop_paying_explanation}। अब मैं आपसे कुछ छोटे सवाल पूछूँगा।",
     "premium_amount": "आपका annual premium कितना है?",
     "premium_term": "आपको यह premium कितने साल तक भरना है?",
     "policy_term": "आपकी policy कितने साल तक चलेगी?",
@@ -66,7 +66,7 @@ def _record_value_for(check_id: str, policy: Mapping[str, Any]) -> str:
     if check_id == "payout_recipient":
         return f"payout {policy['payout_recipient']} को मिलेगा"
     if check_id == "payout_timing":
-        return "pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी"
+        return f"pension payment {policy['payout_start_after_years']} साल बाद शुरू होगी"
     return "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं"
 
 
@@ -669,6 +669,7 @@ class ConversationalCallWorkflow:
             premium_amount=_format_indian_amount(self.policy["premium_amount"]),
             premium_term_years=self.policy["premium_term_years"],
             policy_term_years=self.policy["policy_term_years"],
+            payout_start_after_years=self.policy["payout_start_after_years"],
             product_type=self.policy["product_type"],
             payout_recipient=self.policy["payout_recipient"],
             stop_paying_explanation=(
