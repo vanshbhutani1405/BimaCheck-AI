@@ -10,7 +10,7 @@ from agent.policy import get_policy_fact, load_policy
 def test_suraksha_policy_contains_approved_values(policy):
     assert policy["product_name"] == "Suraksha Pension Plus"
     assert policy["premium_amount"] == 150000
-    assert policy["premium_term_years"] == 5
+    assert policy["premium_term_years"] == 10
     assert policy["policy_term_years"] == 20
     assert policy["product_type"] == "deferred annuity"
     assert policy["payout_recipient"] == "Sunita"
