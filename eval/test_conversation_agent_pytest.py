@@ -42,6 +42,25 @@ def test_structured_response_is_strictly_parsed():
     assert response.conversation_action == ConversationAction.PROPOSE_RECORD_ANSWER
 
 
+def test_missing_optional_response_fields_get_safe_defaults():
+    payload = {"spoken_response": "जी।", "intent": "answer"}
+    response = GeminiConversationAgent.parse_response(json.dumps(payload, ensure_ascii=False))
+    assert response.conversation_action == ConversationAction.RESPOND
+    assert response.tool_proposal is None
+    assert response.answer_candidate is None
+    assert response.policy_fact_ids == ()
+    assert response.handoff_requested is False
+    assert response.end_call_requested is False
+
+
+def test_unexpected_response_fields_are_ignored():
+    response = GeminiConversationAgent.parse_response(
+        response_payload(unexpected_model_note="do not use this")
+    )
+    assert response.intent == ConversationIntent.ANSWER
+    assert response.tool_proposal is None
+
+
 @pytest.mark.parametrize("intent", [value.value for value in ConversationIntent])
 def test_every_supported_intent_parses(intent):
     assert GeminiConversationAgent.parse_response(response_payload(intent=intent)).intent.value == intent
@@ -79,6 +98,13 @@ def test_malformed_response_is_rejected(raw):
         GeminiConversationAgent.parse_response(raw)
 
 
+def test_missing_semantic_field_is_rejected():
+    payload = json.loads(response_payload())
+    del payload["intent"]
+    with pytest.raises(ValueError, match="missing required fields"):
+        GeminiConversationAgent.parse_response(json.dumps(payload, ensure_ascii=False))
+
+
 def test_response_rejects_unapproved_tool():
     with pytest.raises(ValueError):
         GeminiConversationAgent.parse_response(response_payload(tool_proposal={"name": "set_verdict", "arguments": {}}))
@@ -112,6 +138,23 @@ async def test_provider_exception_returns_safe_fallback(bound_policy, session):
     assert response.intent == ConversationIntent.UNKNOWN
     assert response.requires_clarification is True
     assert "समझ" in response.spoken_response
+
+
+@pytest.mark.asyncio
+async def test_malformed_response_returns_safe_fallback(bound_policy, session):
+    class MalformedAgent(GeminiConversationAgent):
+        async def _request(self, prompt):
+            return "not json"
+
+    response = await MalformedAgent(object(), GeminiSettings()).respond(
+        session=session, customer_message="hello", policy=bound_policy
+    )
+
+    assert response.intent == ConversationIntent.UNKNOWN
+    assert response.requires_clarification is True
+    assert response.tool_proposal is None
+    assert response.handoff_requested is False
+    assert response.end_call_requested is False
 
 
 @pytest.mark.asyncio

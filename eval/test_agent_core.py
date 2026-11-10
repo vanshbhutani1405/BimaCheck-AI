@@ -90,6 +90,17 @@ class NumberParserTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(evaluate_check(key, answer, policy).verdict, CheckVerdict.PASS)
 
+    def test_premium_amount_accepts_equivalent_digit_formats_and_hindi_words(self):
+        policy = {"premium_amount": 150000}
+        for answer in (
+            "1,50,000", "1,50,000 है", "₹1,50,000", "150000",
+            "एक लाख पचास हजार", "एक लाख पचास हजार है",
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(evaluate_check("premium_amount", answer, policy).verdict, CheckVerdict.PASS)
+
+        self.assertEqual(evaluate_check("premium_amount", "1,00,000", policy).verdict, CheckVerdict.FAIL)
+
 
 class FlagTests(unittest.TestCase):
     def test_positives_roman_and_devanagari(self):
@@ -175,7 +186,7 @@ class JudgeAndVerdictTests(unittest.TestCase):
         for jr in (JudgeResult("unclear", "", "timeout"), JudgeResult("maybe", "x", "invalid verdict"), JudgeResult("correct", "fabricated", "bad quote"), JudgeResult("correct", "", "missing quote")):
             self.assertNotEqual(evaluate_check("product_type", "FD", policy, judge_result=jr).verdict, CheckVerdict.PASS)
 
-    def test_retry_occurs_once_and_returns_prompt_not_playback_claim(self):
+    def test_one_pass_evaluation_never_requests_a_retry(self):
         calls = []
         async def request_retry():
             calls.append("retry")
@@ -185,15 +196,15 @@ class JudgeAndVerdictTests(unittest.TestCase):
             "premium_term", "one year", policy,
             re_explanation="The record says five years.", get_retry=request_retry,
         ))
-        self.assertEqual(calls, ["retry"])
-        self.assertEqual(result.retries, 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.retries, 0)
         self.assertEqual(result.verdict, CheckVerdict.UNCLEAR)
-        self.assertEqual(prompt, "The record says five years.")
+        self.assertIsNone(prompt)
 
     def test_non_green_safety(self):
         for checks, flags, unresolved, consent, low, failure, expected in [
             ({}, set(), set(), False, False, False, "amber"),
-            ({"premium_amount": CheckResult("premium_amount", CheckVerdict.FAIL, "wrong", True)}, set(), set(), False, False, False, "red"),
+            ({"premium_amount": CheckResult("premium_amount", CheckVerdict.FAIL, "wrong", True)}, set(), set(), False, False, False, "amber"),
             ({}, {Flag.FD_CONFUSION}, set(), False, False, False, "red"),
             ({}, set(), {Flag.THIRD_PARTY}, False, False, False, "red"),
             ({}, set(), set(), True, False, False, "red"),

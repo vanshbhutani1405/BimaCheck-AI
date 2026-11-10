@@ -129,6 +129,7 @@ _NUMBER_CONTEXT_UNITS = frozenset({
     "rupees", "रुपये", "रुपया", "rs",
 })
 _NUMBER_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[A-Za-z]+|[\u0900-\u097F]+", re.UNICODE)
+_PREMIUM_DIGIT_RE = re.compile(r"(?<![\w\d])₹?\s*((?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d+)?)")
 
 
 def _numeric_token(token: str) -> bool:
@@ -171,10 +172,33 @@ def extract_number_for_check(key: str, text: str) -> int | float | None:
     if key not in {"premium_amount", "premium_term", "policy_term", "payout_timing"}:
         return None
     try:
-        # Preserve the established strict-expression behavior for bare answers.
+        # Preserve the established strict-expression behavior for bare answers,
+        # including forms such as ``1.5 lakh``.
         return parse_number(text)
     except NumberParseError:
         pass
+    if key == "premium_amount":
+        digit_candidates: list[tuple[int | float, int, int]] = []
+        year_units = {"saal", "साल", "varsh", "वर्ष", "year", "years"}
+        for match in _PREMIUM_DIGIT_RE.finditer(text):
+            number_text = match.group(1).replace(",", "")
+            number = float(number_text) if "." in number_text else int(number_text)
+            following = _NUMBER_TOKEN_RE.findall(text[match.end():])
+            if following and following[0].casefold() in year_units:
+                continue
+            digit_candidates.append((number, match.start(), match.end()))
+        if len(digit_candidates) == 1:
+            return digit_candidates[0][0]
+        if len(digit_candidates) > 1:
+            amount_terms = ("premium", "प्रीमियम", "annual", "वार्षिक", "rupee", "रुपये", "रुपया", "₹", "rs")
+            scored = []
+            for number, start, end in digit_candidates:
+                context = text[max(0, start - 32):min(len(text), end + 32)].casefold()
+                scored.append((sum(term in context for term in amount_terms), number))
+            best_score = max(score for score, _ in scored)
+            best = [number for score, number in scored if score == best_score]
+            if best_score > 0 and len(best) == 1:
+                return best[0]
     tokens = [token.casefold() for token in _NUMBER_TOKEN_RE.findall(text)]
     candidates = _number_candidates(text)
     if not candidates:
@@ -299,7 +323,8 @@ def evaluate_check(key: str, answer: str, policy: Mapping[str, Any], *, judge_re
     return CheckResult(key, verdict, answer, mandatory, reason=judge_result.reason)
 
 
-async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, Any], *, re_explanation: str, get_retry: Callable[[], Awaitable[str]], judge: "Judge | None" = None) -> tuple[CheckResult, str | None]:
+async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, Any], *, re_explanation: str = "", get_retry: Callable[[], Awaitable[str]] | None = None, judge: "Judge | None" = None) -> tuple[CheckResult, str | None]:
+    """Evaluate the single answer for a check; legacy retry args are ignored."""
     async def evaluate(answer: str) -> CheckResult:
         if key in JUDGE_CHECKS:
             if judge is None:
@@ -313,14 +338,7 @@ async def evaluate_with_retry(key: str, first_answer: str, policy: Mapping[str, 
         return evaluate_check(key, answer, policy)
 
     result = await evaluate(first_answer)
-    if result.verdict in {CheckVerdict.PASS, CheckVerdict.REFUSED}:
-        return result, None
-    retry_answer = await get_retry()
-    retry = await evaluate(retry_answer)
-    retry.retries = 1
-    if retry.verdict == CheckVerdict.PASS:
-        retry.verdict = CheckVerdict.PASS_AFTER_RETRY
-    return retry, re_explanation
+    return result, None
 
 
 @dataclass(frozen=True)
@@ -369,8 +387,8 @@ class VerdictInput:
 
 
 def compute_verdict(data: VerdictInput) -> tuple[str, str]:
-    if data.consent_refused or data.unresolved_flags or any(data.checks.get(k, CheckResult(k, CheckVerdict.UNCLEAR, "", True)).verdict == CheckVerdict.FAIL for k in MANDATORY_CHECKS) or data.unresolved_failure or data.flags:
+    if data.consent_refused or data.unresolved_flags or data.unresolved_failure or data.flags:
         return "red", "hold"
-    if any(data.checks.get(k, CheckResult(k, CheckVerdict.UNCLEAR, "", True)).verdict in {CheckVerdict.UNCLEAR, CheckVerdict.PASS_AFTER_RETRY} for k in MANDATORY_CHECKS) or data.low_confidence:
+    if any(data.checks.get(k, CheckResult(k, CheckVerdict.UNCLEAR, "", True)).verdict in {CheckVerdict.FAIL, CheckVerdict.UNCLEAR, CheckVerdict.REFUSED, CheckVerdict.PASS_AFTER_RETRY} for k in MANDATORY_CHECKS) or data.low_confidence:
         return "amber", "pending_review"
     return "green", "clear"

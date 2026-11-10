@@ -64,12 +64,15 @@ class LiveKitAgentSessionPort:
         self._session_factory = session_factory
         self._agent_factory = agent_factory
         self._session: Any | None = None
-        self._transcripts: asyncio.Queue[str | None] = asyncio.Queue()
+        self._transcripts: asyncio.Queue[tuple[str, int, float] | None] = asyncio.Queue()
         self._queued_transcripts: set[str] = set()
         self._active = False
         self._close_signal_sent = False
         self._turn_commit_tasks: set[asyncio.Task[None]] = set()
         self._last_transcript_at: float | None = None
+        self._turn_sequence = 0
+        self.last_transcript_timing: tuple[int, float] | None = None
+        self._latency_context: dict[str, Any] = {}
 
     async def start(self, *, stt: Any, tts: Any) -> None:
         if self._session_factory is None or self._agent_factory is None:
@@ -91,7 +94,11 @@ class LiveKitAgentSessionPort:
                 },
             )
             if event.is_final:
-                task = asyncio.create_task(self._commit_then_queue(event.transcript))
+                self._turn_sequence += 1
+                turn_id = self._turn_sequence
+                transcript_final_at = time.perf_counter()
+                logger.info("LATENCY turn=%s STT_FINAL_RECEIVED", turn_id)
+                task = asyncio.create_task(self._commit_then_queue(event.transcript, turn_id, transcript_final_at))
                 self._turn_commit_tasks.add(task)
                 task.add_done_callback(self._turn_commit_tasks.discard)
 
@@ -112,15 +119,18 @@ class LiveKitAgentSessionPort:
         logger.info("voice_session_started")
 
     async def listen(self) -> str:
-        transcript = await self._transcripts.get()
-        if transcript is None:
+        queued = await self._transcripts.get()
+        if queued is None:
             logger.info("transcript_queue_interrupted_by_session_close")
             raise SessionClosed("LiveKit AgentSession closed before a final transcript")
+        transcript, turn_id, transcript_final_at = queued
         self._queued_transcripts.discard(transcript)
+        self.last_transcript_timing = (turn_id, transcript_final_at)
+        self._latency_context = {"turn_id": turn_id, "transcript_final_at": transcript_final_at}
         logger.info("transcript_retrieved_from_queue", extra={"text_length": len(transcript)})
         return transcript
 
-    async def _commit_then_queue(self, transcript: str) -> None:
+    async def _commit_then_queue(self, transcript: str, turn_id: int, transcript_final_at: float) -> None:
         """Publish a final STT result only after LiveKit commits its user turn.
 
         In Agents 1.8.10 ``user_input_transcribed`` is emitted from the final
@@ -149,18 +159,34 @@ class LiveKitAgentSessionPort:
             logger.info("duplicate_final_transcript_ignored", extra={"text_length": len(transcript)})
             return
         self._queued_transcripts.add(transcript)
-        self._transcripts.put_nowait(transcript)
+        self._transcripts.put_nowait((transcript, turn_id, transcript_final_at))
         self._last_transcript_at = time.monotonic()
         logger.info("transcript_added_to_queue", extra={"queue_size": self._transcripts.qsize()})
+
+    def update_latency(self, **marks: Any) -> None:
+        if marks.get("turn_id") is not None and marks["turn_id"] != self._latency_context.get("turn_id"):
+            self._latency_context = {}
+        self._latency_context.update(marks)
+
+    @staticmethod
+    def _latency_ms(start: float | None, end: float | None) -> str:
+        return "unavailable" if start is None or end is None else f"{(end - start) * 1000:.1f}"
 
     async def speak(self, text: str) -> None:
         if self._session is None or not self._active:
             raise RuntimeError("LiveKit AgentSession has not started")
         normalized = normalize_tts_text(text)
+        context = self._latency_context
+        turn_id = context.get("turn_id")
+        tts_request_at = time.perf_counter()
+        if turn_id is not None and not context.get("latency_logged"):
+            context["tts_request_at"] = tts_request_at
+            logger.info("LATENCY turn=%s TTS_REQUEST_START", turn_id)
         handle = self._session.say(normalized, allow_interruptions=True, add_to_chat_ctx=False)
         logger.info("speech_scheduled", extra={"text_length": len(normalized), "scheduled": getattr(handle, "scheduled", None)})
 
         def on_done(done_handle: Any) -> None:
+            playback_completed_at = time.perf_counter()
             interrupted = bool(getattr(done_handle, "interrupted", False))
             error = None
             with suppress(Exception):
@@ -169,9 +195,17 @@ class LiveKitAgentSessionPort:
                 "speech_interrupted" if interrupted else "audio_playback_completed",
                 extra={"text_length": len(normalized), "interrupted": interrupted, "error_type": type(error).__name__ if error else None},
             )
+            if turn_id is not None and context.get("tts_request_at") == tts_request_at:
+                context["playback_completed_at"] = playback_completed_at
+                logger.info(
+                    "LATENCY turn=%s PLAYBACK_%s TTS_TO_PLAYBACK_END_MS=%.1f",
+                    turn_id,
+                    "INTERRUPTED" if interrupted else "COMPLETED",
+                    (playback_completed_at - tts_request_at) * 1000,
+                )
 
         handle.add_done_callback(on_done)
-        generation_task = asyncio.create_task(self._observe_generation_start(handle))
+        generation_task = asyncio.create_task(self._observe_generation_start(handle, turn_id, tts_request_at))
         try:
             await handle
             error = handle.exception()
@@ -187,13 +221,44 @@ class LiveKitAgentSessionPort:
         finally:
             with suppress(asyncio.CancelledError):
                 await generation_task
+        if turn_id is not None and not context.get("latency_logged"):
+            transcript_final_at = context.get("transcript_final_at")
+            gemini_started_at = context.get("gemini_started_at")
+            gemini_completed_at = context.get("gemini_completed_at")
+            python_started_at = context.get("python_started_at")
+            python_completed_at = context.get("python_completed_at")
+            evaluation_started_at = context.get("evaluation_started_at")
+            evaluation_completed_at = context.get("evaluation_completed_at")
+            generation_started_at = context.get("generation_started_at")
+            playback_completed_at = context.get("playback_completed_at")
+            logger.info(
+                "LATENCY turn=%s STT_TO_GEMINI_MS=%s GEMINI_MS=%s PYTHON_MS=%s EVAL_MS=%s STT_TO_TTS_REQUEST_MS=%s STT_TO_TTS_GENERATION_START_MS=%s TTS_REQUEST_TO_GENERATION_MS=%s TTS_TO_PLAYBACK_END_MS=%s TOTAL_TO_FIRST_AUDIO_MS=unavailable",
+                turn_id,
+                self._latency_ms(transcript_final_at, gemini_started_at),
+                self._latency_ms(gemini_started_at, gemini_completed_at),
+                self._latency_ms(python_started_at, python_completed_at),
+                self._latency_ms(evaluation_started_at, evaluation_completed_at),
+                self._latency_ms(transcript_final_at, tts_request_at),
+                self._latency_ms(transcript_final_at, generation_started_at),
+                self._latency_ms(tts_request_at, generation_started_at),
+                self._latency_ms(tts_request_at, playback_completed_at),
+            )
+            context["latency_logged"] = True
 
-    async def _observe_generation_start(self, handle: Any) -> None:
+    async def _observe_generation_start(self, handle: Any, turn_id: int | None = None, tts_request_at: float | None = None) -> None:
         """Observe the 1.8.10 handle's internal generation future for diagnostics."""
         while not handle.done() and not getattr(handle, "_generations", ()):
             await asyncio.sleep(0)
         if getattr(handle, "_generations", ()):
             logger.info("audio_generation_started")
+            if turn_id is not None and self._latency_context.get("tts_request_at") == tts_request_at:
+                generation_started_at = time.perf_counter()
+                self._latency_context["generation_started_at"] = generation_started_at
+                logger.info(
+                    "LATENCY turn=%s TTS_GENERATION_START TTS_REQUEST_TO_GENERATION_MS=%.1f",
+                    turn_id,
+                    (generation_started_at - tts_request_at) * 1000,
+                )
 
     async def stop_playback(self) -> None:
         if self._session is not None and self._active:
@@ -271,6 +336,15 @@ class LiveKitSessionIO:
 
     async def listen(self) -> str:
         return await self.session.listen()
+
+    @property
+    def last_transcript_timing(self) -> tuple[int, float] | None:
+        return getattr(self.session, "last_transcript_timing", None)
+
+    def update_latency(self, **marks: Any) -> None:
+        update = getattr(self.session, "update_latency", None)
+        if callable(update):
+            update(**marks)
 
     async def stop_playback(self, *, interrupt_transport: bool = True) -> None:
         task = self._playback_task

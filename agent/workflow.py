@@ -330,16 +330,12 @@ class CallWorkflow:
             return await self._finish(unresolved_failure=True)
 
         for key in CHECK_ORDER:
+            if key not in MANDATORY_CHECKS:
+                continue
             if self.flow.current_check != key:
                 raise RuntimeError("core check order and workflow diverged")
             await self._say(PROMPTS[key])
             first = await self._answer_for_prompt(PROMPTS[key], verification_check_id=key, attempt_number=1)
-            async def retry_answer() -> str:
-                explanation = re_explanation_for(key, self.policy)
-                retry_prompt = PROMPTS["retry"].format(explanation=explanation)
-                await self._say(retry_prompt)
-                return await self._answer_for_prompt(retry_prompt, verification_check_id=key, attempt_number=2)
-            explanation = re_explanation_for(key, self.policy)
             if isinstance(self.policy, Policy):
                 result = self.verifier.evaluate_answer(
                     session=self.session,
@@ -347,34 +343,22 @@ class CallWorkflow:
                     check_id=key,
                     answer_id=self._answer_ids_by_check[key][0],
                 )
-                if result.verdict not in {CheckVerdict.PASS, CheckVerdict.REFUSED}:
-                    await retry_answer()
-                    result = self.verifier.evaluate_answer(
-                        session=self.session,
-                        policy=self.policy,
-                        check_id=key,
-                        answer_id=self._answer_ids_by_check[key][-1],
-                    )
-                    result.retries = 1
-                    if result.verdict == CheckVerdict.PASS:
-                        result.verdict = CheckVerdict.PASS_AFTER_RETRY
-                        self.session.update_answer_status(self._answer_ids_by_check[key][-1], result.verdict.value)
             else:
                 from agent.core import evaluate_with_retry
                 result, _retry_prompt = await evaluate_with_retry(
                     key, first, self.policy,
-                    re_explanation=explanation,
-                    get_retry=retry_answer,
                     judge=self.judge,
                 )
             logger.info("workflow_check_evaluated", extra={"check": key, "verdict": result.verdict.value, "retries": result.retries})
             self.checks[key] = result
-            self.session.update_verification_result(key, result, resolved=result.verdict in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY})
+            self.session.update_verification_result(key, result, resolved=result.verdict != CheckVerdict.PENDING)
             for answer_id in self._answer_ids_by_check.get(key, ()):
                 self.session.update_answer_status(answer_id, result.verdict.value)
             if self.session.pending_question:
                 self.session.resolve_pending_question(question_id=self.session.pending_question.question_id)
             await self.io.publish({"type": "check_update", "session_id": self.session.session_id, "key": key, "verdict": result.verdict.value, "heard": result.heard, "ts_ms": 0})
+            if result.verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}:
+                await self._say(f"Record ke mutabik {re_explanation_for(key, self.policy)}. Aapka jawab match nahi hua; ise review ke liye note kar raha hoon. Chaliye agle sawaal par aate hain.")
             self.flow.advance("check_passed")
             self.session.set_stage(self.flow.stage.value)
             logger.info("workflow_stage_after", extra={"stage": self.flow.stage.value, "check": key})
@@ -386,7 +370,21 @@ class CallWorkflow:
         else:
             verdict, hold = compute_verdict(VerdictInput(checks=self.checks, flags=self.flags))
             reasons = [k for k, c in self.checks.items() if c.verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}]
-        await self._say(PROMPTS["wrap_green"] if verdict == "green" else PROMPTS["human"])
+        if verdict == "green":
+            await self._say("Aapka verification poora ho gaya hai. Aapki di hui sabhi jaankari policy record se match hui hai. Verification safal raha.")
+        else:
+            labels = {
+                "premium_amount": "annual premium", "premium_term": "premium bharne ki avadhi",
+                "policy_term": "policy ki avadhi", "product_type": "product type",
+                "payout_recipient": "payout paane wala", "payout_timing": "pension shuru hone ka samay",
+                "stop_paying": "premium rokne ke parinaam",
+            }
+            mismatches = [labels[key] for key, check in self.checks.items()
+                          if key in labels and check.verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}]
+            if mismatches:
+                await self._say(f"Aapka verification poora ho gaya hai. Ye jaankariyan policy record se match nahi hui: {', '.join(mismatches)}. Is case ko human review ke liye bheja ja raha hai.")
+            else:
+                await self._say(PROMPTS["human"])
         await self.io.publish({"type": "verdict", "session_id": self.session.session_id, "verdict": verdict, "reasons": reasons, "hold_status": hold})
         self.session.complete(human_handoff=verdict != "green")
         return WorkflowResult(verdict, hold, self.checks, self.flags)

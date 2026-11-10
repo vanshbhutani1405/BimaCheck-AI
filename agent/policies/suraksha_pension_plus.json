@@ -27,7 +27,7 @@
     "amount": {
       "available": true,
       "value": 150000,
-      "explanation": "हर साल का premium एक लाख पचास हज़ार रुपये है।"
+      "explanation": "Annual premium ₹1,50,000 है।"
     },
     "frequency": {
       "available": true,
@@ -37,19 +37,19 @@
     "payment_term_years": {
       "available": true,
       "value": 5,
-      "explanation": "Premium पाँच साल तक हर साल भरना है।"
+      "explanation": "Premium हर साल 5 बार भरना है।"
     },
     "payment_details": {
       "available": true,
       "value": "annual premium payments for the stated payment term",
-      "explanation": "Premium एक बार नहीं, बताए गए payment term के दौरान हर साल भरना है।"
+      "explanation": "Premium हर साल 5 बार भरना है।"
     }
   },
   "policy_duration": {
     "total_term_years": {
       "available": true,
       "value": 20,
-      "explanation": "Policy बीस साल तक चलेगी।"
+      "explanation": "Policy की कुल अवधि 20 साल है।"
     },
     "relevant_dates": {
       "available": false,
@@ -80,7 +80,7 @@
       "available": true,
       "value": "after 5 years",
       "years_after_start": 5,
-      "explanation": "Pension पाँच साल बाद शुरू होगी।"
+      "explanation": "Pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी।"
     },
     "benefit_conditions": {
       "available": false,
@@ -93,7 +93,7 @@
     "consequences": {
       "available": true,
       "value": "policy may lapse or benefits may reduce",
-      "explanation": "Premium देना रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
+      "explanation": "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
     },
     "grace_period": {
       "available": false,
@@ -124,11 +124,11 @@
   "approved_explanations": {
     "unsupported_fact": "इस policy record में इस बात की जानकारी उपलब्ध नहीं है। मैं इसकी पुष्टि नहीं कर सकता।",
     "fixed_deposit_confusion": "यह fixed deposit नहीं है; यह deferred annuity pension product है।",
-    "premium_amount": "Record के मुताबिक हर साल का premium एक लाख पचास हज़ार रुपये है।",
-    "premium_term": "Premium हर साल पाँच साल तक भरना है।",
-    "policy_term": "Policy बीस साल तक चलेगी।",
+    "premium_amount": "Record के अनुसार annual premium ₹1,50,000 है।",
+    "premium_term": "Premium हर साल 5 बार भरना है।",
+    "policy_term": "Policy की कुल अवधि 20 साल है।",
     "payout_recipient": "Policy record के मुताबिक payout Sunita को मिलेगा।",
-    "payout_timing": "Pension पाँच साल बाद शुरू होगी।",
+    "payout_timing": "Pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी।",
     "stop_paying": "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं।"
   },
   "verification_mapping": {

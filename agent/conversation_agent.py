@@ -33,7 +33,8 @@ def _diagnostic_sample(value: Any) -> str:
     return text[:MAX_DIAGNOSTIC_SAMPLE]
 
 
-RESPONSE_FIELDS = frozenset(RESPONSE_JSON_SCHEMA["required"])
+RESPONSE_FIELDS = frozenset(RESPONSE_JSON_SCHEMA["properties"])
+REQUIRED_RESPONSE_FIELDS = frozenset({"spoken_response", "intent"})
 
 
 class ConversationIntent(str, Enum):
@@ -307,16 +308,35 @@ class GeminiConversationAgent:
             logger.warning("gemini_response_validation_failed", extra={"reason": "response_not_object"})
             raise ValueError("Gemini response must be an object")
         actual_fields = set(payload)
-        if actual_fields != RESPONSE_FIELDS:
+        missing_fields = REQUIRED_RESPONSE_FIELDS - actual_fields
+        unexpected_fields = actual_fields - RESPONSE_FIELDS
+        if missing_fields:
             logger.warning(
                 "gemini_response_schema_validation_failed",
                 extra={
-                    "missing_fields": tuple(sorted(RESPONSE_FIELDS - actual_fields)),
-                    "unexpected_fields": tuple(sorted(actual_fields - RESPONSE_FIELDS)),
-                    "sample": _diagnostic_sample(text),
+                    "missing_fields": tuple(sorted(missing_fields)),
+                    "response_length": len(text),
                 },
             )
-            raise ValueError("Gemini response fields do not match the response contract")
+            raise ValueError("Gemini response is missing required fields")
+        if unexpected_fields:
+            logger.warning(
+                "gemini_response_extra_fields_ignored",
+                extra={"unexpected_fields": tuple(sorted(str(key) for key in unexpected_fields))},
+            )
+
+        missing_optional_fields = RESPONSE_FIELDS - actual_fields
+        defaults = {
+            "conversation_action": ConversationAction.RESPOND.value,
+            "tool_proposal": None,
+            "requires_clarification": False,
+            "clarification_reason": None,
+            "answer_candidate": None,
+            "policy_fact_ids": [],
+            "handoff_requested": False,
+            "end_call_requested": False,
+        }
+        payload = {**defaults, **{key: value for key, value in payload.items() if key in RESPONSE_FIELDS}}
         spoken = payload["spoken_response"]
         if not isinstance(spoken, str) or not spoken.strip() or len(spoken) > 1000:
             raise ValueError("spoken_response must be a non-empty string under 1000 characters")
@@ -328,6 +348,14 @@ class GeminiConversationAgent:
         )
         intent = ConversationIntent(intent_value)
         action = ConversationAction(action_value)
+        if "requires_clarification" in missing_optional_fields:
+            payload["requires_clarification"] = intent in {
+                ConversationIntent.CLARIFICATION,
+                ConversationIntent.CONFUSION,
+                ConversationIntent.INCOMPLETE,
+                ConversationIntent.SILENCE,
+                ConversationIntent.UNKNOWN,
+            }
         if intent_aliased or action_aliased:
             logger.info(
                 "gemini_enum_normalized",

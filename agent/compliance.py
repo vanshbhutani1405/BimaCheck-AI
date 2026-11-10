@@ -47,6 +47,20 @@ def _quote(answer: str, token: str) -> str:
     return answer[index:index + len(token)] if index >= 0 else answer
 
 
+_RECIPIENT_SCRIPT_VARIANTS = {"sunita": ("सुनीता",)}
+
+
+def _recipient_mention(answer: str, recipient: str) -> str | None:
+    """Match the configured recipient as a whole name in a supported script."""
+    aliases = (recipient, *_RECIPIENT_SCRIPT_VARIANTS.get(recipient.casefold(), ()))
+    for alias in aliases:
+        pattern = rf"(?<![\w\u0900-\u097f]){re.escape(alias)}(?![\w\u0900-\u097f])"
+        match = re.search(pattern, answer, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return None
+
+
 def _deterministic_judge(key: str, answer: str, policy: Policy) -> JudgeResult:
     normalized = answer.casefold()
     if key == "product_type":
@@ -57,8 +71,9 @@ def _deterministic_judge(key: str, answer: str, policy: Policy) -> JudgeResult:
         return JudgeResult("unclear", "", "product type was not clear")
     if key == "payout_recipient":
         recipient = str(policy.get("payout_recipient") or "")
-        if recipient and recipient.casefold() in normalized:
-            return JudgeResult("correct", recipient, "approved payout recipient was identified")
+        mention = _recipient_mention(answer, recipient) if recipient else None
+        if mention:
+            return JudgeResult("correct", mention, "approved payout recipient was identified")
         if any(term in normalized for term in ("mujhe", "mere", "खुद", "मुझे", "myself")):
             return JudgeResult("incorrect", answer, "customer named a recipient different from the approved recipient")
         return JudgeResult("unclear", "", "payout recipient was not clear")
@@ -136,7 +151,7 @@ class VerificationEngine:
         else:
             result = evaluate_check(check_id, evidence.original_answer, policy)
         result.answer_id = evidence.answer_id
-        session.update_verification_result(check_id, result, resolved=result.verdict in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY})
+        session.update_verification_result(check_id, result, resolved=result.verdict != CheckVerdict.PENDING)
         session.update_answer_status(evidence.answer_id, result.verdict.value)
         return result
 
@@ -154,8 +169,10 @@ class VerificationEngine:
             key: value for key, value in session.verification_results.items()
             if isinstance(value, CheckResult)
         }
-        completed = tuple(key for key in MANDATORY_VERIFICATION_CHECKS if checks.get(key, CheckResult(key, CheckVerdict.PENDING, "", True)).verdict in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY})
+        terminal = {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY, CheckVerdict.FAIL, CheckVerdict.UNCLEAR, CheckVerdict.REFUSED}
+        completed = tuple(key for key in MANDATORY_VERIFICATION_CHECKS if checks.get(key, CheckResult(key, CheckVerdict.PENDING, "", True)).verdict in terminal)
         outstanding = tuple(key for key in MANDATORY_VERIFICATION_CHECKS if key not in completed)
+        discrepancies = tuple(key for key in completed if checks[key].verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY})
         confirmed = tuple(dict.fromkeys(risk.flag for risk in session.risk_flags if risk.confirmed))
         evidence = tuple(risk.message_id for risk in session.risk_flags if risk.confirmed and risk.message_id)
         reasons: list[str] = []
@@ -180,10 +197,11 @@ class VerificationEngine:
             reasons.append("call_ended")
         if outstanding:
             reasons.extend(f"mandatory_{key}_outstanding" for key in outstanding)
+        reasons.extend(f"mandatory_{key}_discrepancy" for key in discrepancies)
         if any(checks.get(key) and checks[key].verdict == CheckVerdict.PASS_AFTER_RETRY for key in MANDATORY_VERIFICATION_CHECKS):
             reasons.append("mandatory_check_passed_after_retry")
         if reasons:
-            return self._report("amber", "pending_review", reasons, "The call requires review because verification is incomplete or a non-critical risk remains unresolved.", completed, outstanding, confirmed, evidence)
+            return self._report("amber", "pending_review", reasons, "The call requires review because one or more policy details did not match or a non-critical risk remains.", completed, outstanding, confirmed, evidence)
         return self._report("green", "clear", ["all_mandatory_checks_passed"], "All mandatory checks passed without unresolved compliance concerns.", completed, outstanding, confirmed, evidence)
 
     def _report(self, verdict: str, hold_status: str, reasons: list[str], explanation: str, completed: tuple[str, ...], outstanding: tuple[str, ...], confirmed: tuple[str, ...], evidence: tuple[str, ...]) -> VerdictReport:

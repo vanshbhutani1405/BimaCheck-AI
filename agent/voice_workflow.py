@@ -1,12 +1,15 @@
 """Real-time conversational orchestration above the LiveKit transport seam."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
+import time
 from typing import Any, Mapping
 
-from agent.compliance import MANDATORY_VERIFICATION_CHECKS, VerificationEngine
+from agent.compliance import MANDATORY_VERIFICATION_CHECKS, VerificationEngine, _recipient_mention
 from agent.conversation_agent import ConversationIntent, ConversationResponse, GeminiConversationAgent, ToolProposal
-from agent.core import CHECK_ORDER, CallFlow, CheckVerdict, detect_flags
+from agent.core import CHECK_ORDER, CallFlow, CheckVerdict, detect_flags, extract_number_for_check
 from agent.policy import Policy
 from agent.session import ConsentStatus, SessionContext, SessionStatus
 from agent.tools import ToolExecutionResult, ToolExecutor
@@ -14,24 +17,57 @@ from agent.workflow import VoiceIO, format_policy_value, normalize_tts_text, re_
 
 
 logger = logging.getLogger(__name__)
+ANSWER_FRAGMENT_TIMEOUT_SECONDS = 0.4
 
 VOICE_PROMPTS = {
     "disclosure": "नमस्ते! मैं BimaCheck से बात कर रहा हूँ। आपकी insurance policy की कुछ जानकारी verify करनी है। क्या हम शुरू कर सकते हैं?",
-    "identity": "सबसे पहले, क्या मैं आपका नाम जान सकता हूँ?",
-    "identity_confirm": "धन्यवाद। क्या आपका नाम {name} है?",
-    "facts": "आपकी policy {product_name} एक {product_type} pension product है, fixed deposit नहीं। Annual premium {premium_amount} रुपये है और यह premium हर साल {premium_term_years} साल तक भरना है। आपकी policy {policy_term_years} साल तक चलेगी। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension {payout_timing} शुरू होगी। {stop_paying_explanation}। क्या यह जानकारी सही है?",
+    "identity": "सबसे पहले, कृपया अपना नाम बताइए।",
+    "facts": "आपकी policy {product_name} एक {product_type} pension product है, यानी यह fixed deposit नहीं है। इसमें annual premium ₹{premium_amount} है, जो आपको हर साल {premium_term_years} बार भरना है। आपकी policy की कुल अवधि {policy_term_years} साल है। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी। {stop_paying_explanation}। अब मैं आपसे कुछ छोटे सवाल पूछूँगा।",
     "premium_amount": "आपका annual premium कितना है?",
-    "premium_term": "आपको हर साल premium कितने साल तक भरना होगा?",
+    "premium_term": "आपको हर साल premium कितनी बार भरना होगा?",
     "policy_term": "आपकी policy कितने साल तक चलेगी?",
     "product_type": "यह product fixed deposit है या pension product?",
     "payout_recipient": "Policy record के मुताबिक payout किसे मिलेगा?",
     "payout_timing": "Pension कब शुरू होगी?",
-    "stop_paying": "अगर आप premium देना बंद कर देते हैं, तो क्या हो सकता है?",
+    "stop_paying": "अगर आप premium देना बंद कर दें, तो policy पर क्या असर पड़ सकता है?",
+    "group_premium": "आपका annual premium कितना है और इसे हर साल कितनी बार भरना है?",
+    "group_term": "आपकी policy कितने साल की है और यह किस तरह का product है?",
+    "group_payout": "Policy का payout किसे मिलेगा और pension payment कब शुरू होगी?",
     "affordability": "क्या यह premium आपकी आमदनी के हिसाब से manageable है?",
     "retry": "मैं इसे थोड़ा आसान तरीके से समझाता हूँ: {explanation}। अब आप अपने शब्दों में फिर से बताइए।",
+    "discrepancy": "Record के अनुसार {record_value}। आपने {heard} बताया है, इसलिए इसे discrepancy के रूप में note कर रहा हूँ। बाकी जानकारी verify करते हैं।",
+    "unclear": "जवाब साफ़ नहीं था, इसलिए इसे discrepancy के रूप में note कर रहा हूँ। बाकी जानकारी verify करते हैं।",
     "human": "धन्यवाद। इस call को human review के लिए भेजा जा रहा है।",
     "wrap_green": "धन्यवाद। आपकी जानकारी review के लिए दर्ज कर ली गई है।",
 }
+
+
+def _format_indian_amount(value: Any) -> str:
+    digits = str(int(value))
+    if len(digits) <= 3:
+        return digits
+    groups = [digits[-3:]]
+    prefix = digits[:-3]
+    while prefix:
+        groups.insert(0, prefix[-2:])
+        prefix = prefix[:-2]
+    return ",".join(groups)
+
+
+def _record_value_for(check_id: str, policy: Mapping[str, Any]) -> str:
+    if check_id == "premium_amount":
+        return f"annual premium ₹{_format_indian_amount(policy['premium_amount'])} है"
+    if check_id == "premium_term":
+        return f"premium हर साल {policy['premium_term_years']} बार भरना है"
+    if check_id == "policy_term":
+        return f"policy की कुल अवधि {policy['policy_term_years']} साल है"
+    if check_id == "product_type":
+        return f"यह {policy['product_type']} है"
+    if check_id == "payout_recipient":
+        return f"payout {policy['payout_recipient']} को मिलेगा"
+    if check_id == "payout_timing":
+        return "pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी"
+    return "Premium रोकने पर policy lapse हो सकती है या benefits कम हो सकते हैं"
 
 
 class ConversationalCallWorkflow:
@@ -47,6 +83,14 @@ class ConversationalCallWorkflow:
         self.verifier = VerificationEngine()
         self.flow = CallFlow()
         self._finalized = False
+        self._turn_sequence = 0
+        self._buffered_customer_input: tuple[str, str, tuple[int, float] | None] | None = None
+        self._last_transcript_timing: tuple[int, float] | None = None
+
+    def _update_latency(self, **marks: Any) -> None:
+        update = getattr(self.io, "update_latency", None)
+        if callable(update):
+            update(**marks)
 
     @staticmethod
     def _customer_requested_end(transcript: str) -> bool:
@@ -66,7 +110,13 @@ class ConversationalCallWorkflow:
         await self.io.speak(normalize_tts_text(text))
 
     async def _listen(self) -> tuple[str, str]:
+        if self._buffered_customer_input is not None:
+            buffered, self._buffered_customer_input = self._buffered_customer_input, None
+            text, message_id, self._last_transcript_timing = buffered
+            return text, message_id
         text = await self.io.listen()
+        timing = getattr(self.io, "last_transcript_timing", None)
+        self._last_transcript_timing = timing if isinstance(timing, tuple) and len(timing) == 2 else None
         message_id = self.session.add_message("customer", text)
         await self.io.publish({
             "type": "transcript",
@@ -86,19 +136,54 @@ class ConversationalCallWorkflow:
             )
         return text, message_id
 
-    async def _turn(self, *, pending_check: str | None, attempt: int = 1) -> tuple[str, ConversationResponse, ToolExecutionResult | None]:
-        transcript, message_id = await self._listen()
+    async def _turn(
+        self,
+        *,
+        pending_check: str | None,
+        attempt: int = 1,
+        customer_input: tuple[str, str] | None = None,
+        transcript_timing: tuple[int, float] | None = None,
+    ) -> tuple[str, ConversationResponse, ToolExecutionResult | None]:
+        transcript, message_id = customer_input or await self._listen()
+        self._turn_sequence += 1
+        if customer_input is not None:
+            timing = transcript_timing
+        else:
+            timing = self._last_transcript_timing or getattr(self.io, "last_transcript_timing", None)
+        if isinstance(timing, tuple) and len(timing) == 2:
+            turn_id, transcript_final_at = timing
+        else:
+            turn_id, transcript_final_at = self._turn_sequence, time.perf_counter()
+        self._update_latency(turn_id=turn_id, transcript_final_at=transcript_final_at)
         relevant = ()
         if pending_check:
             fact = self.policy.get_fact(verification_check_id=pending_check)
             relevant = (fact.fact_id,) if fact.exists and fact.fact_id else ()
+        gemini_started_at = time.perf_counter()
+        self._update_latency(gemini_started_at=gemini_started_at)
+        logger.info(
+            "LATENCY turn=%s GEMINI_REQUEST_START STT_TO_GEMINI_MS=%.1f",
+            turn_id,
+            (gemini_started_at - transcript_final_at) * 1000,
+        )
         response = await self.agent.respond(
             session=self.session,
             customer_message=transcript,
             policy=self.policy,
-            customer_context=self.customer,
+            # Keep the expected identity out of Gemini's input until Python
+            # has matched the policyholder name.
+            customer_context=self.customer if self.session.identity_verified else {},
             relevant_fact_ids=relevant,
         )
+        gemini_completed_at = time.perf_counter()
+        python_started_at = gemini_completed_at
+        self._update_latency(gemini_completed_at=gemini_completed_at, python_started_at=python_started_at)
+        logger.info(
+            "LATENCY turn=%s GEMINI_RESPONSE_RECEIVED GEMINI_MS=%.1f",
+            turn_id,
+            (gemini_completed_at - gemini_started_at) * 1000,
+        )
+        logger.info("LATENCY turn=%s PYTHON_WORK_START", turn_id)
         proposal = response.tool_proposal
         if proposal is not None and proposal.name == "record_answer" and pending_check is None:
             logger.warning(
@@ -112,7 +197,36 @@ class ConversationalCallWorkflow:
                 extra={"session_id": self.session.session_id},
             )
             proposal = None
-        if proposal is None and pending_check and response.intent in {ConversationIntent.ANSWER, ConversationIntent.CORRECTION, ConversationIntent.REFUSAL}:
+        in_mandatory_check = pending_check is not None and pending_check == self.flow.current_check
+        current_mandatory_answer = (
+            in_mandatory_check
+            and response.intent not in {ConversationIntent.CUSTOMER_QUESTION, ConversationIntent.CLARIFICATION, ConversationIntent.UNRELATED}
+        )
+        explicit_end_call = (
+            (response.end_call_requested or (proposal is not None and proposal.name == "end_call"))
+            and self._customer_requested_end(transcript)
+        )
+        if in_mandatory_check and not explicit_end_call:
+            if proposal is not None and proposal.name in {"handoff_to_human", "end_call"}:
+                proposal = None
+            if not current_mandatory_answer and proposal is not None and proposal.name == "record_answer":
+                proposal = None
+        preserve_control_action = explicit_end_call or (
+            pending_check != "identity"
+            and not in_mandatory_check
+            and (
+                response.handoff_requested
+                or (proposal is not None and proposal.name in {"handoff_to_human", "end_call"})
+            )
+        )
+        python_evaluates_turn = (
+            pending_check == "identity"
+            or current_mandatory_answer
+        )
+        if python_evaluates_turn and not preserve_control_action:
+            # The pending Python check owns evaluation. Gemini's intent cannot
+            # redirect an identity turn, and an unrelated tool proposal cannot
+            # redirect an answer to the current mandatory check.
             proposal = ToolProposal(
                 "record_answer",
                 {
@@ -123,12 +237,25 @@ class ConversationalCallWorkflow:
                     "attempt_number": attempt,
                 },
             )
-        elif proposal is None and response.handoff_requested:
+        elif proposal is None and pending_check and response.intent in {ConversationIntent.ANSWER, ConversationIntent.CORRECTION, ConversationIntent.REFUSAL}:
+            proposal = ToolProposal(
+                "record_answer",
+                {
+                    "check_id": pending_check,
+                    "answer_candidate": response.answer_candidate or transcript,
+                    "original_transcript": transcript,
+                    "message_id": message_id,
+                    "attempt_number": attempt,
+                },
+            )
+        elif proposal is None and response.handoff_requested and not in_mandatory_check:
             proposal = ToolProposal("handoff_to_human", {"reason": response.clarification_reason or "human assistance requested", "message_id": message_id})
         elif proposal is None and response.end_call_requested and self._customer_requested_end(transcript):
             proposal = ToolProposal("end_call", {"reason": response.clarification_reason or "customer requested the call to end", "confirmation": True, "message_id": message_id})
 
         execution = None
+        evaluation_started_at = None
+        evaluation_completed_at = None
         if proposal is not None:
             arguments = dict(proposal.arguments)
             if proposal.name == "record_answer" and pending_check:
@@ -139,6 +266,8 @@ class ConversationalCallWorkflow:
                 arguments.setdefault("message_id", message_id)
             elif proposal.name == "end_call":
                 arguments.setdefault("message_id", message_id)
+            if proposal.name == "record_answer":
+                evaluation_started_at = time.perf_counter()
             execution = self.executor.execute(
                 tool_name=proposal.name,
                 session=self.session,
@@ -146,6 +275,8 @@ class ConversationalCallWorkflow:
                 policy=self.policy,
                 customer=self.customer,
             )
+            if evaluation_started_at is not None:
+                evaluation_completed_at = time.perf_counter()
             if (
                 proposal.name == "record_answer"
                 and not execution.success
@@ -169,7 +300,49 @@ class ConversationalCallWorkflow:
                     policy=self.policy,
                     customer=self.customer,
                 )
-        await self._speak(response.spoken_response)
+                if evaluation_started_at is not None:
+                    evaluation_completed_at = time.perf_counter()
+        spoken_response = response.spoken_response
+        identity_result = self.session.verification_results.get("identity")
+        identity_matched = identity_result is not None and identity_result.verdict in {
+            CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY,
+        }
+        if not identity_matched:
+            expected_names = (
+                str(self.customer.get("name", "")),
+                *(str(value) for value in self.customer.get("name_variants", ())),
+            )
+            spoken_folded = spoken_response.casefold()
+            if any(name and name.casefold() in spoken_folded for name in expected_names):
+                spoken_response = "जी, धन्यवाद।"
+        if (
+            pending_check is not None
+            and pending_check == self.flow.current_check
+            and execution is not None
+            and execution.tool_name == "record_answer"
+        ):
+            # Python will decide whether to retry or ask the next check. Do not
+            # let Gemini's answer-turn wording announce a different question.
+            spoken_response = "जी।"
+        pending_question = self.session.get_pending_question()
+        python_transition_turn = pending_question is not None and pending_question.verification_check_id in {
+            "consent", "identity", "identity_confirmation", "facts_confirmation",
+        }
+        python_completed_at = time.perf_counter()
+        self._update_latency(
+            python_completed_at=python_completed_at,
+            evaluation_started_at=evaluation_started_at,
+            evaluation_completed_at=evaluation_completed_at,
+        )
+        logger.info(
+            "LATENCY turn=%s PYTHON_WORK_END PYTHON_MS=%.1f EVAL_MS=%s",
+            turn_id,
+            (python_completed_at - python_started_at) * 1000,
+            "unavailable" if evaluation_started_at is None or evaluation_completed_at is None
+            else f"{(evaluation_completed_at - evaluation_started_at) * 1000:.1f}",
+        )
+        if not python_transition_turn:
+            await self._speak(spoken_response)
         for fact_id in response.policy_fact_ids:
             fact = self.policy.get_fact(fact_id=fact_id)
             if fact.exists:
@@ -177,12 +350,23 @@ class ConversationalCallWorkflow:
         return transcript, response, execution
 
     async def _process_check(self, check_id: str, *, advance: bool = True) -> None:
+        if check_id != "identity" and self.flow.current_check != check_id:
+            raise ValueError(f"{check_id!r} is not the current mandatory check")
         prompt = VOICE_PROMPTS[check_id]
         question = self.session.set_pending_question(prompt, verification_check_id=check_id)
         await self._speak(prompt)
         attempt = 1
         while attempt <= 2:
-            transcript, response, execution = await self._turn(pending_check=check_id, attempt=attempt)
+            captured = (
+                await self._capture_group_input((check_id,))
+                if check_id == "stop_paying" and attempt == 1 else None
+            )
+            transcript, response, execution = await self._turn(
+                pending_check=check_id,
+                attempt=attempt,
+                customer_input=(captured[0], captured[1]) if captured else None,
+                transcript_timing=captured[2] if captured else None,
+            )
             if execution is not None and execution.tool_name == "record_answer" and execution.success:
                 status = execution.data.get("verification_status")
                 result = self.session.verification_results.get(check_id)
@@ -199,14 +383,18 @@ class ConversationalCallWorkflow:
                         self.flow.advance("check_passed")
                     self.session.set_stage(self.flow.stage.value)
                     return
-                if status == CheckVerdict.REFUSED.value:
-                    self.executor.execute(
-                        tool_name="handoff_to_human",
-                        session=self.session,
-                        arguments={"reason": "customer refused a mandatory verification answer", "message_id": self.session.conversation_history[-2].message_id},
-                        policy=self.policy,
-                        customer=self.customer,
-                    )
+                if check_id != "identity":
+                    self.session.resolve_pending_question(question_id=question.question_id)
+                    if result is not None:
+                        self.session.update_verification_result(check_id, result, resolved=True)
+                    if status == CheckVerdict.FAIL.value and result is not None:
+                        await self._speak(VOICE_PROMPTS["discrepancy"].format(
+                            record_value=_record_value_for(check_id, self.policy), heard=transcript
+                        ))
+                    else:
+                        await self._speak(VOICE_PROMPTS["unclear"])
+                    self.flow.advance("check_passed")
+                    self.session.set_stage(self.flow.stage.value)
                     return
                 if attempt == 1:
                     await self._speak(VOICE_PROMPTS["retry"].format(explanation=re_explanation_for(check_id, self.policy)))
@@ -222,8 +410,13 @@ class ConversationalCallWorkflow:
                         customer=self.customer,
                     )
                     return
-                self.flow.advance("check_passed")
-                self.session.set_stage(self.flow.stage.value)
+                self.executor.execute(
+                    tool_name="handoff_to_human",
+                    session=self.session,
+                    arguments={"reason": f"mandatory verification failed after retry: {check_id}"},
+                    policy=self.policy,
+                    customer=self.customer,
+                )
                 return
 
             if self.session.status != SessionStatus.ACTIVE:
@@ -243,6 +436,176 @@ class ConversationalCallWorkflow:
             # question until a record_answer operation succeeds.
             await self._speak(question.text)
 
+    async def _process_group(self, check_ids: tuple[str, str], prompt_key: str) -> None:
+        """Evaluate one spoken answer independently against two adjacent checks."""
+        first, second = check_ids
+        if self.flow.current_check != first:
+            raise ValueError(f"{first!r} is not the current mandatory check")
+        if CHECK_ORDER[CHECK_ORDER.index(second) - 1] != first:
+            raise ValueError("grouped checks must be adjacent in the mandatory order")
+
+        prompt = VOICE_PROMPTS[prompt_key]
+        question = self.session.set_pending_question(prompt, verification_check_id=first)
+        await self._speak(prompt)
+
+        # Keep non-answer conversational turns on the same grouped question.
+        while True:
+            captured = await self._capture_group_input(check_ids)
+            transcript, response, execution = await self._turn(
+                pending_check=first,
+                attempt=1,
+                customer_input=(captured[0], captured[1]),
+                transcript_timing=captured[2],
+            )
+            if execution is not None and execution.tool_name == "record_answer" and execution.success:
+                break
+            if self.session.status != SessionStatus.ACTIVE:
+                return
+            if response.intent == ConversationIntent.REFUSAL:
+                # A refusal is a substantive response and is recorded by _turn.
+                break
+            await self._speak(question.text)
+
+        if execution is None or execution.tool_name != "record_answer" or not execution.success:
+            return
+
+        answer_id = execution.data.get("answer_id")
+        first_evidence = next((answer for answer in self.session.answers if answer.answer_id == answer_id), None)
+        if first_evidence is None:
+            return
+        message_id = first_evidence.message_id
+        discrepancies: list[str] = []
+
+        for index, check_id in enumerate(check_ids):
+            if index == 0:
+                current_execution = execution
+            else:
+                second_question = self.session.set_pending_question(prompt, verification_check_id=check_id)
+                current_execution = self.executor.execute(
+                    tool_name="record_answer",
+                    session=self.session,
+                    arguments={
+                        "check_id": check_id,
+                        "answer_candidate": transcript,
+                        "original_transcript": transcript,
+                        "message_id": message_id,
+                        "attempt_number": 1,
+                    },
+                    policy=self.policy,
+                    customer=self.customer,
+                )
+                if not current_execution.success:
+                    raise RuntimeError(f"could not evaluate grouped answer for {check_id}")
+
+            status = current_execution.data.get("verification_status")
+            result = self.session.verification_results.get(check_id)
+            self.session.resolve_pending_question(
+                question_id=question.question_id if index == 0 else second_question.question_id
+            )
+            if result is not None:
+                self.session.update_verification_result(check_id, result, resolved=True)
+            if status != CheckVerdict.PASS.value:
+                if status == CheckVerdict.FAIL.value:
+                    discrepancies.append(f"Record के अनुसार {_record_value_for(check_id, self.policy)}")
+                else:
+                    discrepancies.append("एक जवाब साफ़ नहीं था")
+            self.flow.advance("check_passed")
+            self.session.set_stage(self.flow.stage.value)
+
+        if discrepancies:
+            await self._speak(
+                f"{' और '.join(discrepancies)}। इसे discrepancy के रूप में note कर रहा हूँ। बाकी जानकारी verify करते हैं।"
+            )
+
+    def _missing_group_components(self, check_ids: tuple[str, ...], transcript: str) -> set[str]:
+        missing: set[str] = set()
+        for check_id in check_ids:
+            if check_id in {"premium_amount", "premium_term", "policy_term", "payout_timing"}:
+                present = extract_number_for_check(check_id, transcript) is not None
+            elif check_id == "product_type":
+                normalized = transcript.casefold()
+                present = any(term in normalized for term in (
+                    "fd", "fixed deposit", "फिक्स्ड डिपॉजिट", "एफडी", "annuity", "pension", "पेंशन",
+                ))
+            elif check_id == "payout_recipient":
+                recipient = str(self.policy.get("payout_recipient") or "")
+                present = bool(recipient and _recipient_mention(transcript, recipient))
+            elif check_id == "stop_paying":
+                normalized = transcript.casefold()
+                present = any(term in normalized for term in (
+                    "lapse", "benefit reduce", "benefits reduce", "kam ho", "कम हो", "लैप्स", "कम हो सकते",
+                ))
+            else:
+                present = True
+            if not present:
+                missing.add(check_id)
+        return missing
+
+    @staticmethod
+    def _explicit_uncertainty(transcript: str) -> bool:
+        normalized = transcript.casefold()
+        return any(phrase in normalized for phrase in (
+            "pata nahi", "maloom nahi", "i don't know", "don't know",
+            "नहीं पता", "मालूम नहीं", "पता नहीं",
+        ))
+
+    def _is_group_continuation(
+        self, missing: set[str], transcript: str, *, check_ids: tuple[str, ...]
+    ) -> bool:
+        if not missing or self._customer_requested_end(transcript):
+            return False
+        if self._explicit_uncertainty(transcript):
+            return True
+        supplied = missing - self._missing_group_components(check_ids, transcript)
+        normalized = transcript.casefold()
+        context_cues = {
+            "premium_amount": ("premium", "annual", "प्रीमियम", "₹", "रुपये", "रुपया", "लाख", "हजार", "हज़ार", "rs"),
+            "premium_term": ("premium", "प्रीमियम", "भरना", "देना"),
+            "policy_term": ("policy", "पॉलिसी", "चलेगी", "चलेगा", "term", "अवधि"),
+            "product_type": ("fd", "fixed deposit", "फिक्स्ड डिपॉजिट", "एफडी", "annuity", "pension", "पेंशन"),
+            "payout_recipient": ("को मिलेगा", "payout", "सुनीता"),
+            "payout_timing": ("बाद", "baad", "शुरू", "shuru", "pension", "पेंशन"),
+            "stop_paying": ("lapse", "benefit reduce", "benefits reduce", "कम हो", "लैप्स"),
+        }
+        return any(
+            check_id in supplied
+            and (check_id == "payout_recipient" and _recipient_mention(
+                transcript, str(self.policy.get("payout_recipient") or "")
+            ) or any(cue in normalized for cue in context_cues.get(check_id, ())))
+            for check_id in missing
+        )
+
+    async def _capture_group_input(
+        self, check_ids: tuple[str, ...]
+    ) -> tuple[str, str, tuple[int, float] | None]:
+        first, first_message_id = await self._listen()
+        first_timing = self._last_transcript_timing
+        missing = self._missing_group_components(check_ids, first)
+        normalized_first = first.casefold()
+        unfinished_clause = first.rstrip().endswith((",", "，", ";", "और", "अगर", "तो"))
+        if "stop_paying" in check_ids and "अगर" in normalized_first and "stop_paying" in missing:
+            unfinished_clause = True
+        if (not missing and not unfinished_clause) or self._customer_requested_end(first):
+            return first, first_message_id, first_timing
+
+        try:
+            continuation, continuation_message_id = await asyncio.wait_for(
+                self._listen(), timeout=ANSWER_FRAGMENT_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            return first, first_message_id, first_timing
+        continuation_timing = self._last_transcript_timing
+
+        if self._customer_requested_end(continuation):
+            return continuation, continuation_message_id, continuation_timing
+        if self._is_group_continuation(missing, continuation, check_ids=check_ids):
+            return f"{first} {continuation}".strip(), first_message_id, first_timing
+
+        # A separate turn belongs to the next Python-owned question; do not
+        # merge it into this answer or lose the already retrieved STT event.
+        self._buffered_customer_input = (continuation, continuation_message_id, continuation_timing)
+        return first, first_message_id, first_timing
+
     async def _finalize(self) -> dict[str, Any]:
         if self.session.final_verdict is not None:
             return dict(self.session.final_verdict)
@@ -260,26 +623,6 @@ class ConversationalCallWorkflow:
         await self.io.publish({"type": "verdict", "session_id": self.session.session_id, **stored})
         self._finalized = True
         return stored
-
-    async def _confirm_identity(self) -> bool:
-        """Require an explicit customer confirmation after name matching."""
-        variants = self.customer.get("name_variants", ())
-        display_name = next((str(value) for value in variants if str(value).strip()), str(self.customer.get("name", "")))
-        question = self.session.set_pending_question(
-            VOICE_PROMPTS["identity_confirm"].format(name=display_name),
-            verification_check_id="identity_confirmation",
-        )
-        await self._speak(question.text)
-        confirmation, _, _ = await self._turn(pending_check=None)
-        if self.session.status != SessionStatus.ACTIVE:
-            return False
-        self.session.resolve_pending_question(question_id=question.question_id)
-        normalized = confirmation.casefold()
-        refused = any(word in normalized for word in ("nahi", "nahin", "no", "नहीं"))
-        accepted = any(word in normalized for word in ("haan", "ha", "yes", "sahmat", "हाँ", "जी"))
-        if refused or not accepted:
-            return False
-        return True
 
     async def run(self) -> dict[str, Any]:
         self.flow.advance("connected")
@@ -317,29 +660,20 @@ class ConversationalCallWorkflow:
         if identity is None or identity.verdict != CheckVerdict.PASS:
             return await self._finalize()
 
-        if not await self._confirm_identity():
-            self.executor.execute(
-                tool_name="handoff_to_human",
-                session=self.session,
-                arguments={"reason": "customer did not confirm the configured identity"},
-                policy=self.policy,
-                customer=self.customer,
-            )
-            await self._speak(VOICE_PROMPTS["human"])
-            return await self._finalize()
         self.flow.advance("identity", accepted=True)
         self.session.identity_verified = True
         self.session.set_stage(self.flow.stage.value)
 
         facts = VOICE_PROMPTS["facts"].format(
             product_name=self.policy["product_name"],
-            premium_amount=format_policy_value(self.policy["premium_amount"], kind="amount"),
-            premium_term_years=format_policy_value(self.policy["premium_term_years"], kind="duration"),
-            policy_term_years=format_policy_value(self.policy["policy_term_years"], kind="duration"),
+            premium_amount=_format_indian_amount(self.policy["premium_amount"]),
+            premium_term_years=self.policy["premium_term_years"],
+            policy_term_years=self.policy["policy_term_years"],
             product_type=self.policy["product_type"],
             payout_recipient=self.policy["payout_recipient"],
-            payout_timing=format_policy_value(self.policy["payout_start_after_years"], kind="duration"),
-            stop_paying_explanation=self.policy["stop_paying_explanation"],
+            stop_paying_explanation=(
+                self.policy.approved_explanation("stop_paying") or self.policy["stop_paying_explanation"]
+            ),
         )
         facts_question = self.session.set_pending_question(facts, verification_check_id="facts_confirmation")
         await self._speak(facts)
@@ -361,14 +695,42 @@ class ConversationalCallWorkflow:
         self.session.policy_explanation_completed = True
         self.session.set_stage(self.flow.stage.value)
 
-        for check_id in CHECK_ORDER:
-            # Affordability remains an advisory Python evaluation, not one of
-            # the seven mandatory customer comprehension questions.
-            if check_id == "affordability":
-                continue
-            await self._process_check(check_id)
+        groups = (
+            (("premium_amount", "premium_term"), "group_premium"),
+            (("policy_term", "product_type"), "group_term"),
+            (("payout_recipient", "payout_timing"), "group_payout"),
+            (("stop_paying",), "stop_paying"),
+        )
+        for check_ids, prompt_key in groups:
+            if self.flow.current_check != check_ids[0]:
+                raise RuntimeError("workflow check order diverged from Python call state")
+            if len(check_ids) == 2:
+                await self._process_group(check_ids, prompt_key)
+            else:
+                await self._process_check(check_ids[0])
             if self.session.status != SessionStatus.ACTIVE:
                 break
+            if self.flow.current_check == check_ids[0]:
+                # A check that did not advance is terminal;
+                # never enter a later mandatory check.
+                break
         report = await self._finalize()
-        await self._speak(VOICE_PROMPTS["wrap_green"] if report["verdict"] == "green" else VOICE_PROMPTS["human"])
+        if report["verdict"] == "green":
+            await self._speak("आपका verification पूरा हो गया है। आपकी दी गई सभी जानकारी policy record से match हुई है। Verification सफल रहा।")
+        elif self.session.workflow_complete:
+            labels = {
+                "premium_amount": "annual premium", "premium_term": "premium भरने की अवधि",
+                "policy_term": "policy की अवधि", "product_type": "product type",
+                "payout_recipient": "payout पाने वाला", "payout_timing": "pension शुरू होने का समय",
+                "stop_paying": "premium रोकने के परिणाम",
+            }
+            discrepancies = [labels[key] for key in report.get("mandatory_completed", ())
+                             if key in labels and key in self.session.verification_results
+                             and self.session.verification_results[key].verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}]
+            if discrepancies:
+                await self._speak("आपका verification पूरा हो गया है। कुछ जानकारी policy record से match नहीं हुई, इसलिए इस case को human review के लिए भेजा जा रहा है। हमारी team इन details को verify करेगी।")
+            else:
+                await self._speak(VOICE_PROMPTS["human"])
+        else:
+            await self._speak(VOICE_PROMPTS["human"])
         return report
