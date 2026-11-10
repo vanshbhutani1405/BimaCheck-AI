@@ -195,7 +195,7 @@ async def test_fresh_identity_turn_hides_expected_name_from_gemini_and_speech(bo
 
     assert agent.calls[0]["customer_context"] == {}
     assert all("वंश" not in text and "Vansh" not in text for text in io.spoken)
-    assert VOICE_PROMPTS["identity"] == "सबसे पहले, क्या मैं आपका नाम जान सकता हूँ?"
+    assert VOICE_PROMPTS["identity"] == "सबसे पहले, कृपया अपना नाम बताइए।"
 
 
 @pytest.mark.asyncio

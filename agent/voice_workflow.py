@@ -21,30 +21,42 @@ ANSWER_FRAGMENT_TIMEOUT_SECONDS = 0.4
 
 VOICE_PROMPTS = {
     "disclosure": "नमस्ते! मैं BimaCheck से बात कर रहा हूँ। आपकी insurance policy की कुछ जानकारी verify करनी है। क्या हम शुरू कर सकते हैं?",
-    "identity": "सबसे पहले, क्या मैं आपका नाम जान सकता हूँ?",
-    "facts": "आपकी policy {product_name} एक {product_type} pension product है, fixed deposit नहीं। Annual premium {premium_amount} रुपये है और यह premium हर साल {premium_term_years} साल तक भरना है। आपकी policy {policy_term_years} साल तक चलेगी। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension {payout_timing} शुरू होगी। {stop_paying_explanation}। क्या यह जानकारी सही है?",
+    "identity": "सबसे पहले, कृपया अपना नाम बताइए।",
+    "facts": "आपकी policy {product_name} एक {product_type} pension product है, यानी यह fixed deposit नहीं है। इसमें annual premium ₹{premium_amount} है। आपको यह premium हर साल, कुल {premium_term_years} साल तक भरना है। आपकी policy की कुल अवधि {policy_term_years} साल है। Policy record के मुताबिक payout {payout_recipient} को मिलेगा और pension payment premium भरने की अवधि पूरी होने के बाद शुरू होगी। {stop_paying_explanation}। अब मैं आपसे कुछ छोटे सवाल पूछूँगा, ताकि आपकी policy details verify कर सकूँ।",
     "premium_amount": "आपका annual premium कितना है?",
     "premium_term": "आपको हर साल premium कितने साल तक भरना होगा?",
     "policy_term": "आपकी policy कितने साल तक चलेगी?",
     "product_type": "यह product fixed deposit है या pension product?",
     "payout_recipient": "Policy record के मुताबिक payout किसे मिलेगा?",
     "payout_timing": "Pension कब शुरू होगी?",
-    "stop_paying": "अगर आप premium देना बंद कर देते हैं, तो क्या हो सकता है?",
-    "group_premium": "आपका annual premium कितना है और हर साल premium कितने साल तक भरना होगा?",
-    "group_term": "आपकी policy कितने साल चलेगी और यह fixed deposit है या pension product?",
-    "group_payout": "Policy record के मुताबिक payout किसे मिलेगा और pension कब शुरू होगी?",
+    "stop_paying": "अगर आप premium देना बंद कर दें, तो policy पर क्या असर पड़ सकता है?",
+    "group_premium": "आपका annual premium कितना है और इसे हर साल कितने साल तक भरना है?",
+    "group_term": "आपकी policy कितने साल की है और यह किस तरह का product है?",
+    "group_payout": "Policy का payout किसे मिलेगा और pension payment कब शुरू होगी?",
     "affordability": "क्या यह premium आपकी आमदनी के हिसाब से manageable है?",
     "retry": "मैं इसे थोड़ा आसान तरीके से समझाता हूँ: {explanation}। अब आप अपने शब्दों में फिर से बताइए।",
-    "discrepancy": "Record के मुताबिक {record_value}। आपने {heard} बताया है, इसलिए इसे review के लिए note कर रहा हूँ। चलिए बाकी जानकारी भी verify करते हैं।",
-    "unclear": "मैं आपका जवाब साफ़ नहीं समझ पाया। इसे review के लिए note कर रहा हूँ। चलिए बाकी जानकारी भी verify करते हैं।",
+    "discrepancy": "Record के अनुसार {record_value}। आपने {heard} बताया है, इसलिए इसे discrepancy के रूप में note कर रहा हूँ। बाकी जानकारी verify करते हैं।",
+    "unclear": "जवाब साफ़ नहीं था, इसलिए इसे discrepancy के रूप में note कर रहा हूँ। बाकी जानकारी verify करते हैं।",
     "human": "धन्यवाद। इस call को human review के लिए भेजा जा रहा है।",
     "wrap_green": "धन्यवाद। आपकी जानकारी review के लिए दर्ज कर ली गई है।",
 }
 
 
+def _format_indian_amount(value: Any) -> str:
+    digits = str(int(value))
+    if len(digits) <= 3:
+        return digits
+    groups = [digits[-3:]]
+    prefix = digits[:-3]
+    while prefix:
+        groups.insert(0, prefix[-2:])
+        prefix = prefix[:-2]
+    return ",".join(groups)
+
+
 def _record_value_for(check_id: str, policy: Mapping[str, Any]) -> str:
     if check_id == "premium_amount":
-        return f"annual premium {format_policy_value(policy['premium_amount'], kind='amount')} रुपये है"
+        return f"annual premium ₹{_format_indian_amount(policy['premium_amount'])} है"
     if check_id == "premium_term":
         return f"premium हर साल {format_policy_value(policy['premium_term_years'], kind='duration')} तक भरना है"
     if check_id == "policy_term":
@@ -494,7 +506,7 @@ class ConversationalCallWorkflow:
                 self.session.update_verification_result(check_id, result, resolved=True)
             if status != CheckVerdict.PASS.value:
                 if status == CheckVerdict.FAIL.value:
-                    discrepancies.append(f"Record के मुताबिक {_record_value_for(check_id, self.policy)}")
+                    discrepancies.append(f"Record के अनुसार {_record_value_for(check_id, self.policy)}")
                 else:
                     discrepancies.append("एक जवाब साफ़ नहीं था")
             self.flow.advance("check_passed")
@@ -502,7 +514,7 @@ class ConversationalCallWorkflow:
 
         if discrepancies:
             await self._speak(
-                f"{' और '.join(discrepancies)}; इसे review के लिए note कर रहा हूँ।"
+                f"{' और '.join(discrepancies)}। इसे discrepancy के रूप में note कर रहा हूँ। बाकी जानकारी verify करते हैं।"
             )
 
     def _missing_group_components(self, check_ids: tuple[str, ...], transcript: str) -> set[str]:
@@ -654,13 +666,14 @@ class ConversationalCallWorkflow:
 
         facts = VOICE_PROMPTS["facts"].format(
             product_name=self.policy["product_name"],
-            premium_amount=format_policy_value(self.policy["premium_amount"], kind="amount"),
-            premium_term_years=format_policy_value(self.policy["premium_term_years"], kind="duration"),
-            policy_term_years=format_policy_value(self.policy["policy_term_years"], kind="duration"),
+            premium_amount=_format_indian_amount(self.policy["premium_amount"]),
+            premium_term_years=self.policy["premium_term_years"],
+            policy_term_years=self.policy["policy_term_years"],
             product_type=self.policy["product_type"],
             payout_recipient=self.policy["payout_recipient"],
-            payout_timing=format_policy_value(self.policy["payout_start_after_years"], kind="duration"),
-            stop_paying_explanation=self.policy["stop_paying_explanation"],
+            stop_paying_explanation=(
+                self.policy.approved_explanation("stop_paying") or self.policy["stop_paying_explanation"]
+            ),
         )
         facts_question = self.session.set_pending_question(facts, verification_check_id="facts_confirmation")
         await self._speak(facts)
@@ -715,7 +728,7 @@ class ConversationalCallWorkflow:
                              if key in labels and key in self.session.verification_results
                              and self.session.verification_results[key].verdict not in {CheckVerdict.PASS, CheckVerdict.PASS_AFTER_RETRY}]
             if discrepancies:
-                await self._speak(f"आपका verification पूरा हो गया है। ये जानकारियाँ policy record से match नहीं हुईं: {', '.join(discrepancies)}। इसलिए इस case को human review के लिए भेजा जा रहा है।")
+                await self._speak("आपका verification पूरा हो गया है। कुछ जानकारी policy record से match नहीं हुई, इसलिए इस case को human review के लिए भेजा जा रहा है। हमारी team इन details को verify करेगी।")
             else:
                 await self._speak(VOICE_PROMPTS["human"])
         else:
